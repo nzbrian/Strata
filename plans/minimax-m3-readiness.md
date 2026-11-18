@@ -105,3 +105,23 @@ Then, in order, each step ending in a commit and a check that can fail:
 
 Measured baseline to beat, from the vendored runner on one 5060 Ti with experts in RAM: load 32.0 s, peak RSS
 106,720 MiB, decode 2.42 tok/s. `m3_native` on CPU is 583.6 s for one token's logits and 30.5 GiB resident.
+
+### Step 0, ruled out (2026-11-18, later)
+
+- Tokenisation is identical: libllama and `tools/strata_tokenizer.py` both give `20768,841,14997,894,275,26225,46`.
+- Layer 0 of `m3_native` matches an independent numpy+gguf-py pass to ~2e-7 (sum 180.831352 vs 180.831321) once the
+  script reads `rope.freq_base` (**10,000,000**, not 5e6) and `layer_norm_rms_epsilon` from the file. So the dense
+  layer recipe - RMS, QK-norm before partial RoPE, GQA causal at 1/sqrt(128), dense `swiglu_oai` - is right.
+- `weight_before_ffn` (routing weights applied to the expert input) is **Llama4 only**: `llama-graph.cpp:2020`.
+  MiniMax weights the expert output, as `combine()` does. Not the cause.
+- `swiglu_clamp_shexp` is inside `case LLM_FFN_SILU` only; M3 uses `LLM_FFN_SWIGLU_OAI_MOE` for dense, routed and
+  shared alike (`minimax-m3.cpp:546,555,569`), and the file carries no swiglu/clamp keys, so alpha 1.702 and limit
+  7.0 are the defaults everywhere. Not the cause.
+- No `rope.type`, `rope.scale`, `sliding_window`, softcap or embedding scale in the file. Not the cause.
+- For this 7-token prompt every position is inside indexer block 0, so MSA selection cannot change the attention
+  output here - the divergence is not the block choice either.
+
+Next single action: numpy cross-check of the **first sparse layer (blk.3)** - router, four routed slots, shared
+expert - against `m3_native --dump 3`. If native and numpy agree there too, the divergence is a step the recipe is
+missing, not an implementation error, and the reference graph has to be diffed against `forward.hpp` op by op
+(`msa->bias`, `pos_slot`, and what the no-flash-attn MSA fallback actually computes are the live candidates).

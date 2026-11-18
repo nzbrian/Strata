@@ -177,6 +177,7 @@ int main(int argc, char** argv) {
     std::vector<int> tokens;
     int layers_wanted = 0, top = 5;
     bool report = false;
+    int dump_layer = -1;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };
@@ -195,6 +196,7 @@ int main(int argc, char** argv) {
         } else if (k == "--layers") { if (!next(v)) return 2; layers_wanted = std::atoi(v.c_str()); }
         else if (k == "--top") { if (!next(v)) return 2; top = std::atoi(v.c_str()); }
         else if (k == "--report") report = true;
+        else if (k == "--dump") { if (!next(v)) return 2; dump_layer = std::atoi(v.c_str()); }
         else { std::fprintf(stderr, "unknown argument: %s\n", k.c_str()); return 2; }
     }
     if (model.empty() || tokens.empty()) {
@@ -297,6 +299,12 @@ int main(int argc, char** argv) {
             ++kv[l].n_pos;
         }
 
+        if (dump_layer == l + 1) {                                    // sub-block A: after attention, before FFN
+            double s = 0.0, q = 0.0;
+            for (int i = 0; i < NE; ++i) { s += x[T - 1][i]; q += (double) x[T - 1][i] * x[T - 1][i]; }
+            std::printf("dumpA layer %d sum %.9f sumsq %.9f x0 %.9f x1 %.9f x_last %.9f\n", l + 1, s, q,
+                        x[T - 1][0], x[T - 1][1], x[T - 1][NE - 1]);
+        }
         // the feed-forward: dense swiglu in the leading layers, routed experts plus a shared one after them
         const std::vector<float>* fn = m.get(p + "ffn_norm.weight", err);
         std::vector<float> hn(NE), f(NE);
@@ -358,6 +366,12 @@ int main(int argc, char** argv) {
                 mm::combine(r, rowp.data(), row.data(), NE, f.data());
             }
             for (int i = 0; i < NE; ++i) { x[t][i] += f[i]; if (!std::isfinite(x[t][i])) ++rep.nan_hits; }
+        }
+        if (dump_layer == l + 1) {                                          // the fingerprint a numpy check compares to
+            double s = 0.0, q = 0.0;
+            for (int i = 0; i < NE; ++i) { s += x[T - 1][i]; q += (double) x[T - 1][i] * x[T - 1][i]; }
+            std::printf("dumpF layer %d sum %.9f sumsq %.9f x0 %.9f x1 %.9f x_last %.9f\n", l + 1, s, q,
+                        x[T - 1][0], x[T - 1][1], x[T - 1][NE - 1]);
         }
         if ((l + 1) % 10 == 0 || l + 1 == nL) {
             std::printf("layer       %3d/%d done  %.1f s\n", l + 1, nL, secs(t0));

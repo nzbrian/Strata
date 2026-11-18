@@ -64,6 +64,23 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         num("nextn_predict_layers", g.n_mtp_layers);
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
+    } else if (family == strata::ModelFamily::MiniMaxM3) {
+        // MiniMax-M3.1-Flash: no Gated DeltaNet, no hyper-connections, no MTP block.  Every layer attends over the
+        // whole past (qsa_interval 1), and what makes a layer sparse is its indexer - which the first
+        // `leading_dense_block_count` layers do not carry.  The file names no shared-expert width: the shared expert
+        // is as wide as a routed one (3072 in every published AD file), so take it from the routed key.
+        g.hc = g.hc_lr = 0;
+        g.ssm_state_size = g.ssm_k_heads = g.ssm_v_heads = g.ssm_d_conv = g.ssm_value_dim = g.ssm_conv_channels = 0;
+        g.qsa_interval = 1;
+        num("rope.dimension_count", g.n_rot);
+        num("feed_forward_length", g.n_ff_dense);
+        num("leading_dense_block_count", g.n_dense_lead);
+        num("attention.indexer.head_count", g.idx_q_heads);
+        num("attention.indexer.key_length", g.idx_key_dim);
+        num("attention.indexer.top_k", g.idx_top_k);
+        num("attention.indexer.block_size", g.idx_block);
+        num("attention.indexer.local_blocks", g.idx_local_blocks);
+        if (!meta.get((p + "expert_shared_feed_forward_length").c_str())) g.n_ff_shexp = g.n_ff;
     } else {
         num("hyper_connection.count", g.hc);
         num("hyper_connection.low_rank", g.hc_lr);
@@ -81,13 +98,16 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         err = buf;
         return false;
     };
+    const bool gdn = g.has_gdn();
     if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 || g.n_expert <= 0 ||
-        top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
-        g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0 || g.qsa_interval < 2)
+        top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 ||
+        g.qsa_interval < (gdn ? 2 : 1) ||    // a Qwen interval of 1 would make every layer GDN or every layer attention
+        (gdn && (g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 || g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0)) ||
+        (!gdn && g.n_dense_lead >= g.n_layers) || (!gdn && g.n_dense_lead > 0 && g.n_ff_dense <= 0))
         return bad("a geometry key is zero or out of range");
     if (value_length >= 0 && value_length != key_length) return bad("attention.key_length != attention.value_length");
-    if (g.ssm_value_dim != g.ssm_state_size * g.ssm_v_heads) return bad("ssm.inner_size != ssm.state_size * ssm.time_step_rank");
-    if (g.ssm_v_heads % g.ssm_k_heads) return bad("ssm.time_step_rank is not a multiple of ssm.group_count");
+    if (gdn && g.ssm_value_dim != g.ssm_state_size * g.ssm_v_heads) return bad("ssm.inner_size != ssm.state_size * ssm.time_step_rank");
+    if (gdn && g.ssm_v_heads % g.ssm_k_heads) return bad("ssm.time_step_rank is not a multiple of ssm.group_count");
     if (g.n_head % g.n_head_kv) return bad("attention.head_count is not a multiple of attention.head_count_kv");
     if (g.n_layers % g.qsa_interval) return bad("the layer count is not a multiple of full_attention_interval");
     return true;
@@ -156,6 +176,41 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     const int64_t N = g.n_embd, NE = g.n_expert, FF = g.n_ff, FS = g.n_ff_shexp;
     std::vector<TensorWant> t;
     auto add = [&](const char* s, std::vector<int64_t> shape) { t.push_back({s, std::move(shape)}); };
+    if (g.family == strata::ModelFamily::MiniMaxM3) {
+        // MiniMax-M3.1-Flash, as its AD files name them.  The first `leading_dense_block_count` layers are a plain
+        // dense MLP with full attention and no indexer; the rest are 128 routed experts (4 used) plus one shared
+        // expert, with an indexer.  `attn_q` carries no output gate (64 x 128 = 8192 rows, not twice that), and the
+        // router is a softmax-free sigmoid with a learned bias (`exp_probs_b`).
+        add("attn_norm.weight", {N});
+        add("ffn_norm.weight", {N});
+        add("attn_q.weight", {N, g.n_head * g.head_dim});
+        add("attn_k.weight", {N, g.n_head_kv * g.head_dim});
+        add("attn_v.weight", {N, g.n_head_kv * g.head_dim});
+        add("attn_output.weight", {g.n_head * g.head_dim, N});
+        add("attn_q_norm.weight", {g.head_dim});
+        add("attn_k_norm.weight", {g.head_dim});
+        if (g.has_dense_ffn(layer)) {
+            add("ffn_gate.weight", {N, g.n_ff_dense});
+            add("ffn_up.weight", {N, g.n_ff_dense});
+            add("ffn_down.weight", {g.n_ff_dense, N});
+            return t;
+        }
+        add("ffn_gate_inp.weight", {N, NE});
+        add("exp_probs_b.bias", {NE});
+        add("ffn_gate_exps.weight", {N, FF, NE});
+        add("ffn_up_exps.weight", {N, FF, NE});
+        add("ffn_down_exps.weight", {FF, N, NE});
+        add("ffn_gate_shexp.weight", {N, FS});
+        add("ffn_up_shexp.weight", {N, FS});
+        add("ffn_down_shexp.weight", {FS, N});
+        if (g.has_layer_indexer(layer)) {
+            add("indexer.q_proj.weight", {N, g.idx_q_heads * g.idx_key_dim});
+            add("indexer.k_proj.weight", {N, g.idx_key_dim});
+            add("indexer.q_norm.weight", {g.idx_key_dim});
+            add("indexer.k_norm.weight", {g.idx_key_dim});
+        }
+        return t;
+    }
     // MoE, every layer (the MTP block's too)
     add("ffn_gate_inp.weight", {N, NE});
     add("ffn_gate_inp_shexp.weight", {N});
@@ -199,7 +254,7 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
         add("attn_output.weight", {g.n_head * g.head_dim, N});
         add("attn_q_norm.weight", {g.head_dim});
         add("attn_k_norm.weight", {g.head_dim});
-        if (g.has_indexer() && kind == LayerKind::Attention) {
+        if (kind == LayerKind::Attention && g.has_layer_indexer(layer)) {   // has_layer_indexer implies has_indexer
             // `q_proj` is the QUERY count, `k_proj` the KEY width (round 194: they are different numbers)
             add("indexer.q_proj.weight", {N, g.idx_q_heads * g.idx_key_dim});
             add("indexer.k_proj.weight", {N, g.idx_key_dim});
@@ -223,6 +278,10 @@ inline std::vector<TensorWant> global_tensors(const ModelGeometry& g) {
     std::vector<TensorWant> t;
     t.push_back({"token_embd.weight", {g.n_embd, g.n_vocab}});
     t.push_back({"output.weight", {g.n_embd, g.n_vocab}});
+    if (g.family == strata::ModelFamily::MiniMaxM3) {
+        t.push_back({"output_norm.weight", {g.n_embd}});   // the AD files carry it, and it is the only norm before the head
+        return t;
+    }
     if (g.has_hyper_connections()) {
         t.push_back({"output_hc_down.weight", {g.hc_dim(), g.hc_lr}});
         t.push_back({"output_hc_up.weight", {g.hc_lr, g.hc_dim()}});
@@ -234,7 +293,9 @@ inline std::vector<TensorWant> global_tensors(const ModelGeometry& g) {
 }
 
 /// Whether the family's table names every blk.* tensor its files carry (then an unnamed one is an error).
-inline bool layout_table_complete(const ModelGeometry& g) { return g.family == strata::ModelFamily::Qwen35Moe; }
+inline bool layout_table_complete(const ModelGeometry& g) {
+    return g.family == strata::ModelFamily::Qwen35Moe || g.family == strata::ModelFamily::MiniMaxM3;
+}
 
 /// Checks the model `m` (all shards) against the layout table of `g`.  `checked` counts the tensors found.
 inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g, std::string& err,

@@ -2,6 +2,9 @@
 //
 //   * the architecture guard accepts qwen4exp and qwen35moe and refuses anything else; the engine's guard refuses
 //     qwen35moe with "not ... yet" (no engine path for Qwen3.6 before T1);
+//   * MiniMax-M3.1-Flash (minimax-m3) is recognised, guarded by its own keys, read into a geometry (no GDN, no
+//     gated residual, 3 dense layers first, an indexer on the rest), passed by its own layout table and still
+//     refused as a shape the compiled kernels were not built for;
 //   * geometry_from_gguf reads Qwen3.6-35B-A3B's real metadata values (hidden 2048, 40 + 1 MTP layers, 32 GDN V
 //     heads, conv 8192, no hyper-connections, no indexer) and Flash-Next's as exactly the compiled defaults;
 //   * the layout tables, on tiny files of either family: a complete file passes, a wrong shape, a missing tensor
@@ -89,6 +92,47 @@ std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
     return kv;
 }
 
+/// MiniMax-M3.1-Flash's metadata as its file says it (AtomicChat/MiniMax-M3.1-Flash-GGUF, AD-* shards): 60 layers,
+/// the first 3 dense, 6144 wide, 64 heads over 4 KV heads of 128, 128 experts with 4 + 1 shared of 3072, and an
+/// indexer that picks 16 blocks of 128 keys.  No tensors: the family and the guards need the header only.
+struct M3Dims {
+    uint64_t layers, dense, embd, ffn_dense, heads, heads_kv, head, rot, experts, used, e_ff, idx_heads, idx_key,
+        idx_topk, idx_block, idx_local;
+};
+// the real model, and a five-layer stand-in whose tensors are a few KB (head_dim 16 keeps the same shape rules)
+const M3Dims kM3Real = {60, 3, 6144, 12288, 64, 4, 128, 64, 128, 4, 3072, 4, 128, 16, 128, 1};
+const M3Dims kM3Tiny = {5, 2, 64, 48, 4, 2, 16, 8, 4, 2, 32, 2, 8, 4, 4, 1};
+
+std::vector<Kv> minimax_metadata(const M3Dims& d, uint64_t vocab = 8) {
+    std::vector<Kv> kv = {fixture::str("general.architecture", "minimax-m3"),
+                          fixture::u32("minimax-m3.block_count", d.layers),
+                          fixture::u32("minimax-m3.leading_dense_block_count", d.dense),
+                          fixture::u32("minimax-m3.embedding_length", d.embd),
+                          fixture::u32("minimax-m3.feed_forward_length", d.ffn_dense),
+                          fixture::u32("minimax-m3.attention.head_count", d.heads),
+                          fixture::u32("minimax-m3.attention.head_count_kv", d.heads_kv),
+                          fixture::u32("minimax-m3.attention.key_length", d.head),
+                          fixture::u32("minimax-m3.attention.value_length", d.head),
+                          fixture::u32("minimax-m3.rope.dimension_count", d.rot),
+                          fixture::u32("minimax-m3.expert_count", d.experts),
+                          fixture::u32("minimax-m3.expert_used_count", d.used),
+                          fixture::u32("minimax-m3.expert_shared_count", 1),
+                          fixture::u32("minimax-m3.expert_feed_forward_length", d.e_ff),
+                          // the two keys that decide the MATH, not the shapes - the real AD shard says 2 and 1
+                          fixture::u32("minimax-m3.expert_gating_func", 2),   // 2 = sigmoid gating
+                          fixture::u32("minimax-m3.expert_weights_norm", 1),  // and the selected weights are normalised
+                          fixture::u32("minimax-m3.attention.indexer.head_count", d.idx_heads),
+                          fixture::u32("minimax-m3.attention.indexer.key_length", d.idx_key),
+                          fixture::u32("minimax-m3.attention.indexer.top_k", d.idx_topk),
+                          fixture::u32("minimax-m3.attention.indexer.block_size", d.idx_block),
+                          fixture::u32("minimax-m3.attention.indexer.local_blocks", d.idx_local)};
+    std::vector<std::string> tokens;
+    for (uint64_t i = 0; i < vocab; ++i) tokens.push_back("t" + std::to_string(i));
+    kv.push_back(fixture::str_array("tokenizer.ggml.tokens", tokens));
+    return kv;
+}
+std::vector<Kv> minimax_metadata() { return minimax_metadata(kM3Real); }
+
 /// The tensors the layout table of `g` names, as F32 fixtures.
 std::vector<Tensor> tensors_of(const strata::core::ModelGeometry& g) {
     std::vector<Tensor> ts;
@@ -143,6 +187,24 @@ std::string layout_error(const fs::path& dir, const char* arch, const Dims& d, u
     if (mutate) mutate(ts);
     const fs::path model = dir / (std::string(arch) + "-tiny.gguf");
     fixture::write(model, metadata(arch, d, vocab), ts);
+    const strata::GgufModel m({model.string()});
+    size_t n = 0;
+    if (!strata::core::check_gguf_layout(m, g, err, &n)) return err;
+    return {};
+}
+
+/// The tiny M3 model's layout: its geometry from its own metadata, its tensors from the table, and the verdict.
+std::string minimax_layout(const fs::path& dir, const char* tag, void (*mutate)(std::vector<Tensor>&)) {
+    const fs::path meta = dir / (std::string(tag) + "-meta.gguf");
+    fixture::write(meta, minimax_metadata(kM3Tiny, 8), {});
+    strata::core::ModelGeometry g;
+    int64_t k = 0;
+    std::string err;
+    if (!geometry_of(meta, g, k, err)) return "geometry: " + err;
+    std::vector<Tensor> ts = tensors_of(g);
+    if (mutate) mutate(ts);
+    const fs::path model = dir / (std::string(tag) + "-tiny.gguf");
+    fixture::write(model, minimax_metadata(kM3Tiny, 8), ts);
     const strata::GgufModel m({model.string()});
     size_t n = 0;
     if (!strata::core::check_gguf_layout(m, g, err, &n)) return err;
@@ -216,6 +278,105 @@ int main(int argc, char** argv) {
         fixture::write(miss, kv, {});
         check(strata::check_architecture(strata::GgufFile(miss.string())).find("ssm.time_step_rank") != std::string::npos,
               "a qwen35moe file without ssm.time_step_rank is refused, naming the key");
+    }
+    {
+        // MiniMax-M3.1-Flash: recognised, guarded by its own keys, and refused as a family with no engine yet
+        const fs::path mm = d.path / "minimax.gguf";
+        fixture::write(mm, minimax_metadata(), {});
+        const strata::GgufFile m(mm.string());
+        check(strata::model_family(m) == strata::ModelFamily::MiniMaxM3, "model_family: minimax-m3 is MiniMaxM3");
+        check(strata::check_architecture(m).empty(), "the architecture guard accepts a MiniMax-M3.1-Flash file");
+        const std::string e = strata::check_engine_architecture(m);
+        check(e.find("MiniMax-M3.1-Flash") != std::string::npos && e.find("no engine for yet") != std::string::npos,
+              "the engine guard refuses it as recognised without an engine: " + e);
+        check(e.find("Intel Arc") == std::string::npos && e.find("CUDA") == std::string::npos,
+              "and does not send the person to another build that cannot run it either");
+        std::vector<Kv> kv = minimax_metadata();
+        for (auto it = kv.begin(); it != kv.end(); ++it)
+            if (it->key == "minimax-m3.attention.indexer.top_k") { kv.erase(it); break; }
+        const fs::path noidx = d.path / "minimax-noidx.gguf";
+        fixture::write(noidx, kv, {});
+        check(strata::check_architecture(strata::GgufFile(noidx.string())).find("indexer.top_k") != std::string::npos,
+              "a minimax-m3 file without attention.indexer.top_k is refused, naming the key");
+        kv = minimax_metadata();
+        for (auto& e2 : kv)
+            if (e2.key == "minimax-m3.expert_used_count") e2 = fixture::u32(e2.key, 200);
+        const fs::path wide = d.path / "minimax-wide.gguf";
+        fixture::write(wide, kv, {});
+        check(strata::check_architecture(strata::GgufFile(wide.string())).find("expert_used_count") != std::string::npos,
+              "more experts used than the file has experts is refused, naming the key");
+        // gating and normalisation change what the router computes, so a file that asks for something else is
+        // refused by name rather than routed with sigmoid anyway
+        kv = minimax_metadata();
+        for (auto& e2 : kv)
+            if (e2.key == "minimax-m3.expert_gating_func") e2 = fixture::u32(e2.key, 1);   // 1 = softmax
+        fixture::write(d.path / "minimax-softmax.gguf", kv, {});
+        check(strata::check_architecture(strata::GgufFile((d.path / "minimax-softmax.gguf").string()))
+                  .find("expert_gating_func") != std::string::npos,
+              "a MiniMax file that asks for softmax gating is refused, naming the key");
+        decltype(kv) nonorm;
+        for (const auto& e2 : kv)
+            if (e2.key != "minimax-m3.expert_weights_norm") nonorm.push_back(e2);
+        fixture::write(d.path / "minimax-nonorm.gguf", nonorm, {});
+        check(strata::check_architecture(strata::GgufFile((d.path / "minimax-nonorm.gguf").string()))
+                  .find("expert_weights_norm") != std::string::npos,
+              "and one that drops expert_weights_norm is refused too, because the reference requires it");
+    }
+    {
+        // MiniMax-M3.1-Flash's geometry and layout table (the numbers its AD files carry)
+        const fs::path p = d.path / "minimax-geo.gguf";
+        fixture::write(p, minimax_metadata(kM3Real, 8), {});
+        strata::core::ModelGeometry g;
+        int64_t top_k = 0;
+        std::string err;
+        const bool ok = geometry_of(p, g, top_k, err);
+        check(ok, "M3 geometry reads" + (ok ? std::string() : ": " + err));
+        check(g.family == strata::ModelFamily::MiniMaxM3 && g.n_layers == 60 && g.n_embd == 6144 && top_k == 4,
+              "M3: 60 layers, hidden 6144, 4 of 128 experts per token");
+        check(g.n_head == 64 && g.n_head_kv == 4 && g.head_dim == 128 && g.n_rot == 64,
+              "M3 attention: 64 Q / 4 KV x 128, 64 rotated dims");
+        check(g.n_ff == 3072 && g.n_ff_shexp == 3072 && g.n_ff_dense == 12288,
+              "M3 MoE: expert FF 3072, the shared expert the same width (the file names no key for it), dense FF 12288");
+        check(g.idx_q_heads == 4 && g.idx_key_dim == 128 && g.idx_top_k == 16 && g.idx_block == 128 &&
+                  g.idx_local_blocks == 1,
+              "M3 indexer: 4 heads of 128, 16 blocks of 128 keys, 1 local block");
+        check(g.qsa_interval == 1 && g.n_gdn_layers() == 0 && g.n_qsa_layers() == 60 && !g.has_hyper_connections(),
+              "M3: no GDN and no gated residual; every layer attends over the whole past");
+        check(g.n_dense_lead == 3 && !g.has_layer_indexer(0) && !g.has_layer_indexer(2) && g.has_layer_indexer(3) &&
+                  g.has_dense_ffn(2) && !g.has_dense_ffn(3),
+              "M3: layers 0-2 are dense FFN with full attention, layer 3 on is sparse MoE with an indexer");
+        auto names = [&](int64_t l) {
+            std::string s;
+            for (const auto& w : strata::core::layer_tensors(g, l)) s += w.name + ";";
+            return s;
+        };
+        check(names(0).find("ffn_gate.weight") != std::string::npos &&
+                  names(0).find("_exps.") == std::string::npos && names(0).find("indexer.") == std::string::npos,
+              "the table gives a dense M3 layer a plain MLP and no indexer");
+        // exact names, not substrings: a renamed or suffixed tensor would still satisfy a find()
+        // exact entries, not loose substrings: `;name;` only matches a whole row of the table, so a renamed or
+        // suffixed tensor can no longer satisfy the check by accident
+        auto holds = [&](int64_t l, const char* n) {
+            return (";" + names(l)).find(std::string(";") + n + ";") != std::string::npos;
+        };
+        check(holds(3, "ffn_gate_inp.weight") && holds(3, "ffn_gate_exps.weight") && holds(3, "exp_probs_b.bias") &&
+                  holds(3, "ffn_gate_shexp.weight") && holds(3, "ffn_down_shexp.weight") &&
+                  holds(3, "indexer.q_proj.weight") && holds(3, "indexer.k_norm.weight") &&
+                  !holds(3, "ffn_gate.weight") && !holds(3, "attn_q_gate.weight"),
+              "and a sparse one the router, the sigmoid bias, routed and shared experts and the indexer, no dense MLP");
+        check(!strata::core::compiled_geometry_mismatch(g).empty() &&
+                  strata::core::compiled_geometry_mismatch(g).find("MiniMax-M3.1-Flash") != std::string::npos,
+              "the kernels still say they are built for another shape: " + strata::core::compiled_geometry_mismatch(g));
+        check(minimax_layout(d.path, "m3ok", nullptr).empty(), "a complete M3 file passes its layout table");
+        check(minimax_layout(d.path, "m3extra", [](std::vector<Tensor>& ts) {
+                  ts.push_back({"blk.3.attn_gate.weight", {64, 64}, F32, 200});
+              }).find("attn_gate") != std::string::npos,
+              "an M3 tensor the table does not name is refused, naming it");
+        check(minimax_layout(d.path, "m3qwen", [](std::vector<Tensor>& ts) {
+                  for (auto& x : ts)
+                      if (x.name == "blk.3.attn_q.weight") x.shape = {64, 2 * 4 * 16};   // Qwen's gated q: not M3's
+              }).find("attn_q") != std::string::npos,
+              "M3's attn_q with Qwen's output-gate width is refused, naming the tensor");
     }
     {
         // the geometry of the real models, from their metadata values

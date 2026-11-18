@@ -364,6 +364,18 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
 
+  # MiniMax-M3.1-Flash's routed experts: the sigmoid router with its selection bias, the normalise-and-scale, the
+  # top-k tie rule and swiglu_oai, against a double reference (synthetic: no model, no GPU)
+  add_executable(m3_moe_test tests/minimax/moe_test.cpp)
+  target_include_directories(m3_moe_test PRIVATE include)
+  add_test(NAME m3_moe_test COMMAND m3_moe_test)
+
+  # MiniMax-M3.1-Flash's sparse attention: the indexer's max-of-block score, the +1e30 local force, the holes in a
+  # paged cache and the top-k over blocks, against a reference (synthetic: no model, no GPU)
+  add_executable(m3_indexer_test tests/minimax/indexer_test.cpp)
+  target_include_directories(m3_indexer_test PRIVATE include)
+  add_test(NAME m3_indexer_test COMMAND m3_indexer_test)
+
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
   add_executable(tuning_header_arch_family_test tests/prefill/tuning_header_arch_family_test.cpp)

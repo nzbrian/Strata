@@ -56,10 +56,22 @@ struct ModelGeometry {
 
     // appended for the model families (Qwen3.6 = qwen35moe); the defaults keep Flash-Next's values
     int64_t n_ff_shexp = 640;       ///< the shared expert's FFN width (qwen4exp: equal to n_ff, read_geometry checks)
+    int64_t n_ff_dense = 0;         ///< feed_forward_length: the FFN width of the dense layers (minimax-m3: 12288);
+                                    ///  0 for the Qwen families, whose every layer is MoE
+    int64_t n_dense_lead = 0;       ///< leading_dense_block_count: dense FFN and full attention on these first layers
+                                    ///  (minimax-m3: 3); 0 for the Qwen families, which follow full_attention_interval
+    int64_t idx_local_blocks = 0;   ///< attention.indexer.local_blocks: always-recent blocks beside the selected ones
     ModelFamily family = ModelFamily::Qwen4Exp;
     int64_t n_mtp_layers = 0;       ///< MTP blocks inside the model file, after the trunk (qwen35moe: blk.40)
 
     constexpr bool has_indexer() const { return idx_q_heads > 0; }              ///< false: dense attention only
+    constexpr bool has_gdn() const { return ssm_state_size > 0; }               ///< false: no Gated DeltaNet layer
+    /// The indexer exists on some layers only: MiniMax-M3 has none on its leading dense layers, and the Qwen
+    /// families gate it by layer kind (an attention layer), which the callers already know.
+    constexpr bool has_layer_indexer(int64_t layer) const {
+        return idx_q_heads > 0 && (n_dense_lead <= 0 || layer >= n_dense_lead);
+    }
+    constexpr bool has_dense_ffn(int64_t layer) const { return n_dense_lead > 0 && layer < n_dense_lead; }
     constexpr bool has_hyper_connections() const { return hc > 0; }             ///< false: plain pre-norm residual
     constexpr int64_t hc_dim() const { return hc * n_embd; }
     /// `layer % qsa_interval == qsa_interval - 1` is full attention.  Derived, not a second list.
@@ -85,6 +97,8 @@ namespace strata::core {
 
 /// True for the full-attention layers.  `docs/semantics.md` gives this twice over - `full_attention_interval
 /// = 4` and an explicit `attention.compress_ratios` array - and `read_geometry` checks that the two agree.
+/// MiniMax-M3 reads its geometry with `qsa_interval = 1`: every layer attends over the whole past, and what makes
+/// a layer sparse is its indexer, not an interval - so every layer is "full attention" here and none is GDN.
 inline bool is_qsa_layer(const ModelGeometry& g, int64_t layer) {
     return layer % g.qsa_interval == g.qsa_interval - 1;
 }

@@ -664,6 +664,48 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// MiniMax-M3.1-Flash's guard: the keys its geometry will be read from, and the three relations a file of this
+/// architecture must satisfy.  The model's own shape (60 layers, 3 of them dense first, 128 experts with 4 + 1
+/// shared, an indexer on the sparse layers) is in the file, so a file that is not that model is refused here, by
+/// key - not later, by a kernel that was compiled for another shape.
+inline std::string check_architecture_minimax_m3(const GgufFile& g) {
+    static const char* const keys[] = {
+        "minimax-m3.block_count", "minimax-m3.embedding_length", "minimax-m3.attention.head_count",
+        "minimax-m3.attention.head_count_kv", "minimax-m3.attention.key_length", "minimax-m3.attention.value_length",
+        "minimax-m3.rope.dimension_count", "minimax-m3.expert_count", "minimax-m3.expert_used_count",
+        "minimax-m3.expert_feed_forward_length", "minimax-m3.expert_shared_count",
+        "minimax-m3.leading_dense_block_count", "minimax-m3.attention.indexer.head_count",
+        "minimax-m3.attention.indexer.key_length", "minimax-m3.attention.indexer.top_k",
+        "minimax-m3.attention.indexer.block_size", "minimax-m3.attention.indexer.local_blocks",
+        // the reference reads both of these as required, and they change the math rather than the shapes: sigmoid
+        // gating (Strata routes this family with sigmoid) and normalised weights (Strata normalises)
+        "minimax-m3.expert_gating_func", "minimax-m3.expert_weights_norm",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not a number";
+    }
+    const uint64_t n_expert = g.get("minimax-m3.expert_count")->u, n_used = g.get("minimax-m3.expert_used_count")->u;
+    if (n_used == 0 || n_used > n_expert) return "minimax-m3.expert_used_count is not between 1 and expert_count";
+    if (g.get("minimax-m3.leading_dense_block_count")->u >= g.get("minimax-m3.block_count")->u)
+        return "minimax-m3.leading_dense_block_count is not smaller than minimax-m3.block_count";
+    if (g.get("minimax-m3.attention.indexer.block_size")->u < 1)
+        return "minimax-m3.attention.indexer.block_size must be at least 1 (a sparse block of keys)";
+    // Strata's M3 math is sigmoid gating with normalised weights, which is what this family's files carry (the
+    // AD-IQ2_XXS shard says expert_gating_func 2 = sigmoid and expert_weights_norm 1).  A file that asks for
+    // softmax, or for un-normalised weights, would route differently than these kernels do, so it is refused here
+    // rather than quietly reinterpreted - the same reason the shapes above are checked.
+    const MetaValue* gating = g.get("minimax-m3.expert_gating_func");
+    if (gating && gating->u != 2)
+        return "minimax-m3.expert_gating_func is " + std::to_string(gating->u) +
+               ", and Strata routes this family with sigmoid gating (2)";
+    const MetaValue* wnorm = g.get("minimax-m3.expert_weights_norm");
+    if (wnorm && wnorm->u == 0)
+        return "minimax-m3.expert_weights_norm is 0, and Strata normalises this family's selected expert weights";
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -851,6 +893,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::MiniMaxM3) return check_architecture_minimax_m3(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

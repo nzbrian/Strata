@@ -232,6 +232,36 @@ int main() {
         check(near(out3[0], (float) expect3, 1e-4f),
               "each expert's own row is used (a shared scratch row would give 2x expert 1)");
     }
+    {
+        // the bug this check exists for: a cache that grew into a reserved capacity is strided by the CAPACITY,
+        // and reading it with the position count shifts every KV head after the first onto the wrong keys
+        const mm::LayerDims d = tiny_dims();
+        const int used = 2, cap = 5;
+        std::vector<float> q((size_t) d.n_head * d.head_dim, 0.0f);
+        for (int j = 0; j < d.head_dim; ++j) { q[j] = 1.0f; q[(size_t) (d.n_head - 1) * d.head_dim + j] = 1.0f; }
+        std::vector<float> kc((size_t) d.n_head_kv * cap * d.head_dim, 0.0f), vc(kc.size(), 0.0f);
+        for (int h = 0; h < d.n_head_kv; ++h) {
+            for (int p = 0; p < used; ++p) {
+                for (int j = 0; j < d.head_dim; ++j) {
+                    kc[((size_t) h * cap + p) * d.head_dim + j] = 0.0f;                       // score 0 everywhere
+                    vc[((size_t) h * cap + p) * d.head_dim + j] = (float) (10 + h);            // head 0 -> 10, head 1 -> 11
+                }
+            }
+        }
+        const bool all[] = {true, true};
+        std::vector<float> out((size_t) d.n_head * d.head_dim, 0.0f);
+        mm::attn_one(q.data(), kc.data(), vc.data(), all, d, used, out.data(), cap);
+        check(near(out[0], 10.0f), "with the capacity stride, group 0 reads its own values (10)");
+        // the first head of the LAST group is (n_head_kv - 1) * group; dividing a head index by group gives a KV-head
+        // number, which is a different thing and pointed this check at group 0
+        const int last_group_head = (d.n_head_kv - 1) * (d.n_head / d.n_head_kv);
+        check(near(out[(size_t) last_group_head * d.head_dim], 11.0f),
+              "and the LAST group reads its own values (11), not the first group's");
+        std::vector<float> bad((size_t) d.n_head * d.head_dim, 0.0f);
+        mm::attn_one(q.data(), kc.data(), vc.data(), all, d, used, bad.data());               // ld defaults to n_pos
+        check(!near(bad[(size_t) last_group_head * d.head_dim], 11.0f),
+              "and this check would have failed on the compact stride - that was the bug");
+    }
     std::printf("%s\n", failures == 0 ? "ALL PASSED" : "FAILED");
     return failures == 0 ? 0 : 1;
 }

@@ -115,8 +115,11 @@ inline void project_norm_rope(const float* h, const LayerDims& d, const float* w
 /// (the new token's K/V are already written into column `pos`); every query head reads the KV head `i / group`.
 /// The softmax is online (max, then sum) so a long cache cannot overflow, and the scale is the reference's
 /// 1/sqrt(head_dim) with no softcap and no bias.
+/// `ld` is the stride between positions IN HEADS (`kc` is [n_head_kv][ld][head_dim]): a cache that grew into a
+/// reserved capacity has ld > n_pos, and reading it with n_pos silently shifts every KV head after the first.
 inline void attn_one(const float* q, const float* kc, const float* vc, const bool* visible, const LayerDims& d,
-                     int n_pos, float* out) {
+                     int n_pos, float* out, int ld = 0) {
+    if (ld <= 0) ld = n_pos;                                      // the compact case, and what the tests use
     if (!dims_ok(d) || n_pos <= 0) return;
     const int group = d.n_head / d.n_head_kv;
     const float scale = 1.0f / std::sqrt((float) d.head_dim);
@@ -124,8 +127,8 @@ inline void attn_one(const float* q, const float* kc, const float* vc, const boo
     for (int i = 0; i < d.n_head; ++i) {
         const int kvh = i / group;
         const float* qi = q + (size_t) i * d.head_dim;
-        const float* ki = kc + (size_t) kvh * n_pos * d.head_dim;
-        const float* vi = vc + (size_t) kvh * n_pos * d.head_dim;
+        const float* ki = kc + (size_t) kvh * ld * d.head_dim;
+        const float* vi = vc + (size_t) kvh * ld * d.head_dim;
         float m = -INFINITY, l = 0.0f;
         for (int j = 0; j < d.head_dim; ++j) acc[j] = 0.0f;
         for (int p = 0; p < n_pos; ++p) {

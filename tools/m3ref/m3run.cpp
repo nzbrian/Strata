@@ -164,6 +164,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < a.n_tokens; ++i) {
         const llama_token id = llama_sampler_sample(smpl, ctx, -1);
         llama_sampler_accept(smpl, id);
+        if (made == 0) std::printf("first token id  %d\n", (int) id);   // the number the native path must match
         char piece[256] = {0};
         const int32_t n = llama_token_to_piece(vocab, id, piece, sizeof(piece) - 1, 0, false);
         if (n > 0) out.append(piece, n);

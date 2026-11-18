@@ -154,8 +154,13 @@ class Model {
 /// The KV cache of one layer, as float rows per KV head, positions appended in order.
 struct KvCache {
     std::vector<float> k, v;
-    int n_pos = 0;
-    void reserve(int n_kv, int dim, int cap) { k.assign((size_t) n_kv * cap * dim, 0.0f); v.assign(k.size(), 0.0f); n_pos = 0; }
+    int n_pos = 0, cap = 0;
+    void reserve(int n_kv, int dim, int capacity) {
+        cap = capacity;
+        k.assign((size_t) n_kv * cap * dim, 0.0f);
+        v.assign(k.size(), 0.0f);
+        n_pos = 0;
+    }
 };
 
 struct Report {
@@ -285,7 +290,8 @@ int main(int argc, char** argv) {
             } else {
                 for (int i = 0; i <= kv[l].n_pos; ++i) vis[i] = true;
             }
-            mm::attn_one(q.data(), kv[l].k.data(), kv[l].v.data(), vis.get(), m.dims, kv[l].n_pos + 1, aout.data());
+            mm::attn_one(q.data(), kv[l].k.data(), kv[l].v.data(), vis.get(), m.dims, kv[l].n_pos + 1, aout.data(),
+                            kv[l].cap);   // the cache is strided by its capacity, not by the positions used
             mm::linear(wo->data(), aout.data(), o.data(), H * HD, NE);
             for (int i = 0; i < NE; ++i) { x[t][i] += o[i]; if (!std::isfinite(x[t][i])) ++rep.nan_hits; }
             ++kv[l].n_pos;

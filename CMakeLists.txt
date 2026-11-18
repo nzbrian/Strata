@@ -382,6 +382,10 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(m3_forward_test PRIVATE include)
   add_test(NAME m3_forward_test COMMAND m3_forward_test)
 
+  # the whole model's forward pass in Strata C++ on real weights (CPU, needs the 112 GB file: a tool, not a test)
+  add_executable(m3_native tools/m3ref/m3_native.cpp)
+  target_link_libraries(m3_native PRIVATE strata_artifact $<TARGET_NAME_IF_EXISTS:strata_quant>)
+
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
   add_executable(tuning_header_arch_family_test tests/prefill/tuning_header_arch_family_test.cpp)

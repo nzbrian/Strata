@@ -78,6 +78,50 @@ DEEPSEEK3_PATTERNS = (
 )
 
 
+# The `minimax-m2` pre-tokenizer - MiniMax-M3.1-Flash carries it as tokenizer.ggml.pre = "minimax-m2".  Transcribed
+# from llama.cpp at the pin in third_party/strata-llama (src/llama-vocab.cpp, LLAMA_VOCAB_PRE_TYPE_MINIMAX_M2), one
+# pattern, and the family sets clean_spaces false (the file agrees: tokenizer.ggml.clean_spaces = 0).  It is the
+# GPT-4o shape with the letter classes narrowed by a lookahead (`(?=[\p{L}])([^a-z])`) instead of \p{L}\p{M}, so a
+# combining mark is cut where qwen35 would carry it along - the same class of difference that made the qwen35 rule
+# worth transcribing by hand rather than by family resemblance.
+MINIMAX_M2_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+# The pattern a pack ships, per `pre` type, with where it came from.  Only the single-pattern families are here:
+# a sequence family (deepseek3) has no one pattern to ship, and shipping the wrong one is silent corruption - the
+# reader would encode every prompt with another model's rule and no error.  `pre_pattern_for` refuses those.
+PRE_PATTERN = {
+    "qwen35": (QWEN35_PATTERN, "third_party/strata-llama src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
+    "minimax-m2": (MINIMAX_M2_PATTERN,
+                   "third_party/strata-llama src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_MINIMAX_M2)"),
+}
+
+
+def pre_pattern_for(pre):
+    """The (pattern, source) a tokenizer.json carries for the model's `pre` type.  Refuses a sequence family and an
+    unknown one; both would ship a rule the model does not use."""
+    kind = pre_tokenizer_kind(pre)
+    if kind not in PRE_PATTERN:
+        raise ValueError("no single splitting pattern to ship for pre=%r (type %r): %s" %
+                         (pre, kind, "a sequence family ships its patterns in order" if kind else
+                          "this pre-tokenizer type is unknown to Strata"))
+    return PRE_PATTERN[kind]
+
+
+def findall_whole(compiled, text: str) -> list[str]:
+    """Every match of `compiled` as the WHOLE match.  llama.cpp's split reads group 0, and a transcribed pattern
+    can carry capturing groups (minimax-m2's letter classes do) - `findall` would hand back those groups' tuples
+    instead of the pieces, and every id downstream would be wrong without an error."""
+    return [m.group() for m in compiled.finditer(text)]
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -109,6 +153,8 @@ def pre_tokenizer_kind(pre) -> str | None:
         return "qwen35"
     if p.startswith("deepseek"):
         return "deepseek3"
+    if p == "minimax-m2":
+        return "minimax-m2"
     return None
 
 
@@ -139,9 +185,13 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        if pre_tokenizer_kind(pre) == "deepseek3":
+        kind = pre_tokenizer_kind(pre)
+        if kind == "deepseek3":
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
+        elif kind == "minimax-m2":
+            self._re = regex.compile(MINIMAX_M2_PATTERN)
+            self._split = lambda text: findall_whole(self._re, text)
         else:
             self._re = regex.compile(QWEN35_PATTERN)
             self._split = self._re.findall
@@ -498,8 +548,8 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": pre_pattern_for(tk.pre)[0],
+        "pre_pattern_source": pre_pattern_for(tk.pre)[1],
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

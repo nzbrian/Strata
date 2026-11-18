@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -448,3 +449,100 @@ class PreTokenizerType(unittest.TestCase):
         seq = [ST.regex.compile(x) for x in ST.DEEPSEEK3_PATTERNS]
         self.assertEqual(d._split(text), ST._sequence_findall(seq, text))
         self.assertEqual(ST.Tokenizer(toks, [], None, "deepseek-v3")._split(text), d._split(text))
+
+
+class MiniMaxM2(unittest.TestCase):
+    """MiniMax-M3.1-Flash (architecture `minimax-m3`) carries tokenizer.ggml.pre = "minimax-m2".  The pattern is a
+    transcription, so it is checked three ways: against the vendored llama.cpp source it was copied from, against
+    the qwen35 rule it replaces (they must differ, or the transcription changed nothing), and by a round trip over
+    the corpus.  A real 200,064-token vocabulary is round-tripped too when the file is on this machine."""
+
+    def vocab(self):
+        return [chr(i) for i in range(32, 127)] + ["\n", "\t", "你", "好"]
+
+    def test_the_type_is_known_and_builds(self):
+        self.assertEqual(ST.pre_tokenizer_kind("minimax-m2"), "minimax-m2")
+        self.assertEqual(ST.Tokenizer(self.vocab(), [], None, "minimax-m2").pre, "minimax-m2")
+        self.assertIsNone(ST.pre_tokenizer_kind("minimax-m3"))     # the file says minimax-m2, nothing else
+        with self.assertRaises(ST.UnknownPreTokenizer):
+            ST.Tokenizer(self.vocab(), [], None, "minimax-m3")
+
+    def test_the_pattern_is_the_vendored_transcription(self):
+        src = ROOT / "third_party" / "strata-llama" / "src" / "llama-vocab.cpp"
+        if not src.is_file():
+            self.skipTest("the vendored llama.cpp is not in this checkout")
+        body = src.read_text(encoding="utf-8", errors="replace")
+        at = body.find("LLAMA_VOCAB_PRE_TYPE_MINIMAX_M2:")
+        self.assertGreater(at, 0, "the vendored llama.cpp has no MINIMAX_M2 case to compare against")
+        window = body[at:at + 6000]
+        # the case carries the model's ORIGINAL tokenizer.json regex as a comment right above the one llama.cpp
+        # actually uses, and the two differ (the commented one keeps \p{M} in its letter classes): drop comments
+        window = re.sub(r"//[^\n]*", "", window)
+        lit = re.search(r'regex_exprs\s*=\s*\{\s*"((?:[^"\\]|\\.)+)"', window)
+        self.assertIsNotNone(lit, "no regex literal under the MINIMAX_M2 case")
+        raw = lit.group(1)
+        out, i = [], 0
+        while i < len(raw):                                  # C++ string literal -> the runtime text
+            if raw[i] == "\\":
+                out.append({"n": "\n", "t": "\t", "\\": "\\", '"': '"'}.get(raw[i + 1], raw[i + 1]))
+                i += 2
+            else:
+                out.append(raw[i]); i += 1
+        self.assertEqual("".join(out), ST.MINIMAX_M2_PATTERN, "the transcription drifted from llama.cpp")
+
+    def test_it_splits_differently_from_qwen35(self):
+        text = "Hello, world!  don't stop café 你好 12345\r\nb"   # the clitic class is where the two rules part
+        m = ST.Tokenizer(self.vocab(), [], None, "minimax-m2")
+        q = ST.Tokenizer(self.vocab(), [], None, "qwen35")
+        pieces = m._split(text)
+        self.assertTrue(all(isinstance(x, str) for x in pieces),
+                        "the pattern captures groups; the split must return the whole match, not tuples")
+        self.assertIn(" don't", pieces)          # llama.cpp's clitic class attaches 't to the word
+        self.assertNotIn(" don't", q._split(text))
+        self.assertNotEqual(pieces, q._split(text))
+
+    def test_round_trip_over_the_corpus(self):
+        rnd = random.Random(11)
+        # a byte-level vocabulary: a printable-ASCII one cannot represent every byte, and the failure would be a
+        # KeyError from the test's own vocab rather than anything about the splitting rule
+        tk = ST.Tokenizer([ST.BYTE_TO_UNICODE[b] for b in range(256)], [], [1] * 256, "minimax-m2")
+        for _ in range(60):
+            s = random_text(rnd, 200, ())
+            self.assertEqual(tk.decode(tk.encode(s)), s, repr(s[:60]))
+
+    def test_the_pack_ships_the_models_own_pattern(self):
+        self.assertEqual(ST.pre_pattern_for("minimax-m2")[0], ST.MINIMAX_M2_PATTERN)
+        self.assertIn("MINIMAX_M2", ST.pre_pattern_for("minimax-m2")[1])
+        self.assertEqual(ST.pre_pattern_for("qwen35")[0], ST.QWEN35_PATTERN)
+        self.assertEqual(ST.pre_pattern_for(None)[0], ST.QWEN35_PATTERN)
+        for bad in ("deepseek-v3", "qwen4", None.__class__):       # a sequence family and an unknown one
+            if bad is None.__class__:
+                continue
+            with self.subTest(bad):
+                with self.assertRaises(ValueError):
+                    ST.pre_pattern_for(bad)
+
+    def test_real_vocabulary_when_the_file_is_here(self):
+        import glob
+        path = os.environ.get("STRATA_MINIMAX_GGUF")
+        if not path:
+            # wherever the Hub cache lives on this machine: $HF_HOME, else the default ~/.cache/huggingface
+            roots = [os.environ.get("HF_HOME"), str(Path.home() / ".cache" / "huggingface")]
+            hits = []
+            for r in roots:
+                if r:
+                    hits += glob.glob(str(Path(r).expanduser() / "hub" / "models--AtomicChat--MiniMax-M3.1-Flash-GGUF"
+                                          / "snapshots" / "*" / "AD-IQ2_XXS" / "*-00001-of-00003.gguf"))
+            path = sorted(hits)[0] if hits else None
+        if not path or not Path(path).is_file():
+            self.skipTest("MiniMax-M3.1-Flash is not downloaded on this machine")
+        from gguf_reader import GGUFFile
+        md = GGUFFile(Path(path)).metadata
+        self.assertEqual(md.get("tokenizer.ggml.pre"), "minimax-m2")
+        tk = ST.Tokenizer(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
+                          list(md["tokenizer.ggml.token_type"]), "minimax-m2")
+        self.assertEqual(len(tk.tokens), 200064)
+        rnd = random.Random(3)
+        for s in [random_text(rnd, 400, ()), "def f(x): return x + 1  # café 你好 \U0001f600",
+                  "line one\r\nline two\t\t indented", "don't stop believing — 1.618", "   \n\n   "]:
+            self.assertEqual(tk.decode(tk.encode(s)), s, repr(s[:60]))

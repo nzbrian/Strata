@@ -125,3 +125,21 @@ Next single action: numpy cross-check of the **first sparse layer (blk.3)** - ro
 expert - against `m3_native --dump 3`. If native and numpy agree there too, the divergence is a step the recipe is
 missing, not an implementation error, and the reference graph has to be diffed against `forward.hpp` op by op
 (`msa->bias`, `pos_slot`, and what the no-flash-attn MSA fallback actually computes are the live candidates).
+
+### Step 0, also ruled out
+
+- Expert-slot dequant is **byte-exact against ggml**: one full slot of `blk.3.ffn_gate_exps.weight` (IQ1_M, 18,874,368
+  elements) and of `blk.3.ffn_down_exps.weight` (IQ2_XXS) both give `max |strata - ggml| = 0`. So the slot byte
+  stride (`total_bytes / n_experts`, block-aligned) and the IQ decoders are not the divergence. The check is
+  `/tmp/oracle.cpp` on this machine: link `build-m3/libstrata_quant.a` with `-lggml`, use
+  `ggml_get_type_traits(type)->to_float`, and read the byte offset as `tensor.data.offset + tensor.data_offset`
+  - only for 3-D stacks, since a 2-D tensor has no expert stride.
+- gguf-py cannot dequantise IQ1_M for the numpy path, so the numpy cross-check stops at the dense layers; use
+  ggml as the second decoder for quantised tensors instead.
+
+Live hypothesis, next thing to read: the MSA attention path itself. `build_attn_msa_fa(Qcur, kfa, vfa, mfa, Gp,
+kq_scale, il)` is handed `Gp = n_head / n_head_kv` (16), and the no-flash-attn fallback branch of
+`minimax-m3.cpp` (the `zero`/`pos_slot`/`ggml_scale` block around L460-520) is what actually ran in the reference
+run - flash attention was off. Read that branch op by op against `forward.hpp` before writing any kernel: if the
+sparse path pools or scales by `Gp`, or masks beyond the selected blocks differently, every sparse layer inherits
+it and the dense layers stay correct - exactly the symptom.

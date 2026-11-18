@@ -103,8 +103,8 @@ int main(int argc, char** argv) {
     mp.n_gpu_layers = a.n_gpu_layers;
     mp.load_mode = a.no_mmap ? LLAMA_LOAD_MODE_NONE : LLAMA_LOAD_MODE_MMAP;
 
-    // Keep the routed experts in RAM: they are 92% of this file's bytes and 57 x 4 slots per token, which no card
-    // here can hold. NOTE the pattern is a bare tensor-name regex - the `=CPU` suffix is llama.cpp's COMMAND-LINE
+    // Keep the routed experts in RAM: they are 91.8% of this file's weights (95.89 of 104.45 GiB) and 5 x 57 slots
+    // per token at top-4 plus the shared expert, which no card here can hold. NOTE the pattern is a bare tensor-name regex - the `=CPU` suffix is llama.cpp's COMMAND-LINE
     // syntax, not the API's, and passing it here makes the regex match nothing, which sends all 104 GiB to the card.
     std::vector<llama_model_tensor_buft_override> ov;
     if (a.experts_cpu) {

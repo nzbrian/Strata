@@ -376,6 +376,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(m3_indexer_test PRIVATE include)
   add_test(NAME m3_indexer_test COMMAND m3_indexer_test)
 
+  # one M3 decoder layer's recipe - rms, partial RoPE, QK-norm order, GQA causal attention, dense swiglu FFN -
+  # against numbers worked out by hand (synthetic weights: no model, no GPU)
+  add_executable(m3_forward_test tests/minimax/forward_test.cpp)
+  target_include_directories(m3_forward_test PRIVATE include)
+  add_test(NAME m3_forward_test COMMAND m3_forward_test)
+
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
   add_executable(tuning_header_arch_family_test tests/prefill/tuning_header_arch_family_test.cpp)

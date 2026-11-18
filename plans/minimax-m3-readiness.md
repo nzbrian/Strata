@@ -70,3 +70,38 @@ That is expected and is a tokenizer/template gap, not a weight or kernel gap.
 No Strata kernel ran. No perplexity, no quality comparison, no long-context run, no vision (the mmproj is downloaded
 but unread), no batch > 1, no KV cache type experiments, and no run with the experts on GPU. The 3.75 GiB-per-token
 figure is arithmetic on tensor sizes with zero reuse, not a speed and not a prediction.
+
+## Continue here (2026-11-18, late)
+
+Step 0, the blocker: `m3_native` and the llama.cpp reference disagree on the next token (200058 vs 53390) for
+`--tokens 20768,841,14997,894,275,26225,46` ("Write one sentence about the Moon.", no chat template). `m3_native`
+and an independent numpy+gguf-py pass now agree on layer 0 to ~3.5e-3 relative (sum 180.831 vs 181.052) - too big
+for float32-vs-double accumulation, too small to explain the disjoint top-5, so there is a third divergence inside
+layer 0. Localise it by fingerprinting the sub-blocks in both paths: after attention-before-FFN, and after FFN.
+The dump hook is `--dump N` in `tools/m3ref/m3_native.cpp` (prints sum, sumsq, x0, x1, x_last of the last token
+after layer N); the numpy path is /tmp/m3_np.py on this machine (reshape GGUF 2-D tensors as [ne1][ne0], dim 0
+fastest - reshaping as [ne0][ne1] scrambles them and cost an hour).
+
+Then, in order, each step ending in a commit and a check that can fail:
+
+1. Acceptance harness: `m3_native` top-1 and top-5 logits against `m3run` for a fixed prompt, golden file in the
+   repo. Nothing after this is believed until this passes.
+2. `src/minimax/m3_engine.cu` + `include/strata/minimax/engine.hpp`, `strata::minimax::run()`, mirroring
+   `src/qwen35`: weights uploaded still quantised, `--serve` protocol (READY/GEN/T/DONE/STOP/PP), `--tokens`.
+   The family switch is `src/program/generate.cpp` "THE FAMILY SWITCH"; `model_family_has_engine()` stays false
+   until the acceptance test passes on GPU.
+3. Kernels, one at a time, each with a parity test against `include/strata/minimax/forward.hpp`: fused
+   rms+add_rms; partial RoPE with QK-norm; projections through `strata::kernels::iq_mmvq(ggml_type, ...)` (it is
+   family-neutral already); GQA causal attention over the KV cache at head_dim 128 with no output gate; the router
+   (F32 selection, lower-index tie rule, weight sum = scale) and the expert GEMV with `swiglu_oai` fused including
+   `(1 + clamp(up))`; then MSA.
+4. MSA needs new kernels, not QSA's: block 128 against QSA's 4, top-16 blocks against 2048 cells. Indexer dot +
+   max-pool + the `+1e30` local bias + top-k + gather, parity against `include/strata/minimax/indexer.hpp`.
+5. Expert cache at M3 slot sizes - `ExpertCache::open_sized()` already takes per-slot byte counts (13.46 MiB here)
+   and accepts up to 65,535 experts, so this is policy and sizing, not a new cache.
+6. Tokenizer and template on the host side (`tools/strata_tokenizer.py` already handles `pre = minimax-m2` and
+   round-trips the real vocabulary; the 11,629-character jinja template is the open piece - `llama_chat_apply_template`
+   cannot help, it has no jinja parser), then `--family`, the model list, capabilities, docs.
+
+Measured baseline to beat, from the vendored runner on one 5060 Ti with experts in RAM: load 32.0 s, peak RSS
+106,720 MiB, decode 2.42 tok/s. `m3_native` on CPU is 583.6 s for one token's logits and 30.5 GiB resident.

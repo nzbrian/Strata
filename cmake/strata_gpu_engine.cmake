@@ -545,6 +545,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
   endif()
 
+  # the MiniMax-M3.1-Flash engine path (src/minimax): `strata` switches to it for a minimax-m3 model (the family
+  # switch at the top of its main) and strata-m3 wraps it on its own. A CPU forward to start (the CUDA kernels -
+  # projections through native_mmvq, the expert GEMV, the MSA attention - are the next increment); it links the Strata
+  # quant layer for the GGUF dequant.
+  add_library(strata_minimax STATIC src/minimax/m3_engine.cu)
+  target_include_directories(strata_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata_minimax PRIVATE $<TARGET_NAME_IF_EXISTS:strata_quant> strata_warnings ${_strata_gpu_runtime_target})
+  add_executable(strata-m3 src/minimax/m3_main.cpp)
+  strata_utf8_manifest(strata-m3)
+  target_link_libraries(strata-m3 PRIVATE strata_minimax ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_minimax)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_MINIMAX=1)
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)

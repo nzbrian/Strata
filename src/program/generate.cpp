@@ -160,6 +160,9 @@
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
 #endif
+#if defined(STRATA_HAVE_MINIMAX)
+#include "strata/minimax/engine.hpp"
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -3646,14 +3649,19 @@ int main(int argc, char** argv) {
     // goes on below exactly as before.  Only the architecture string is read (the header of --native's shard).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
-        bool qwen35 = false;
+        bool qwen35 = false, minimax = false;
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
-            qwen35 = strata::model_family(meta) == strata::ModelFamily::Qwen35Moe;
+            const strata::ModelFamily fam = strata::model_family(meta);
+            qwen35 = fam == strata::ModelFamily::Qwen35Moe;
+            minimax = fam == strata::ModelFamily::MiniMaxM3;
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }
         if (qwen35) return strata::qwen35::run(argc, argv);
+#if defined(STRATA_HAVE_MINIMAX)
+        if (minimax) return strata::minimax::run(argc, argv);
+#endif
         break;
     }
 #endif

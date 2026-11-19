@@ -551,7 +551,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # quant layer for the GGUF dequant.
   add_library(strata_minimax STATIC src/minimax/m3_engine.cu)
   target_include_directories(strata_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata_minimax PRIVATE $<TARGET_NAME_IF_EXISTS:strata_quant> strata_warnings ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_minimax PRIVATE $<TARGET_NAME_IF_EXISTS:strata_quant> strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-m3 src/minimax/m3_main.cpp)
   strata_utf8_manifest(strata-m3)
   target_link_libraries(strata-m3 PRIVATE strata_minimax ${_strata_gpu_runtime_target})

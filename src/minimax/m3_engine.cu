@@ -19,6 +19,7 @@
 #include "strata/quant/act.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "m3_cuda.cuh"
 
 namespace K = strata::kernels;
@@ -46,6 +47,17 @@ namespace Q = strata::quant;
 const char* g_dump_q = nullptr;
 bool mmf_debug = false;
 std::vector<float> g_dump_q_data;
+const char* g_dump_x = nullptr;
+const char* g_dump_xa = nullptr;
+const char* g_dump_dv = nullptr;
+const char* g_dump_dq = nullptr;
+const char* g_dump_qn = nullptr;
+const char* g_dump_qr = nullptr;
+std::vector<float> g_dump_qr_data;
+const char* g_dump_da = nullptr;
+std::vector<float> g_dump_da_data;
+const char* g_dump_kr = nullptr;
+std::vector<float> g_dump_kr_data;
 
 namespace {
 
@@ -230,9 +242,14 @@ bool forward(Model& m, const std::vector<int>& tokens, int n_layers, std::vector
         for (int t = 0; t < T; ++t) {
             mm::rms_norm(x[t].data(), an->data(), h.data(), NE, (float) m.geom.rms_eps);
             std::vector<float> qnorm_out;
+            if (g_dump_qn && l == 0 && t == 0) { std::FILE* f=std::fopen(g_dump_qn,"w"); for(int i=0;i<HD;++i) std::fprintf(f,"%.6f\n",qn?(*qn)[i]:1.0f); std::fclose(f); }
+            if (g_dump_dq && l == 0 && t == T - 1) { std::vector<float> qp((size_t)H*HD); mm::linear(wq->data(), h.data(), qp.data(), NE, H*HD); std::FILE* f=std::fopen(g_dump_dq,"w"); for(int i=0;i<H*HD;++i) std::fprintf(f,"%.6f\n",qp[i]); std::fclose(f); }
             mm::project_norm_rope(h.data(), m.dims, wq->data(), wk->data(), wv->data(), qn ? qn->data() : nullptr,
                                   kn ? kn->data() : nullptr, (float) t, q.data(), kk.data(), vv.data(), &qnorm_out);
-            if (g_dump_q && l == 0 && t == 0) { g_dump_q_data.assign(qnorm_out.begin(), qnorm_out.begin() + H * HD); }
+            if (g_dump_dv && l == 0 && t == T - 1) { std::FILE* f=std::fopen(g_dump_dv,"w"); for(int i=0;i<HKV*HD;++i) std::fprintf(f,"%.6f\n",vv[i]); std::fclose(f); }
+            if (g_dump_q && l == 0 && t == T - 1) { g_dump_q_data.assign(qnorm_out.begin(), qnorm_out.begin() + H * HD); }
+            if (g_dump_qr && l == 0 && t == T - 1) { g_dump_qr_data.assign(q.begin(), q.begin() + H * HD); }
+            if (g_dump_kr && l == 0 && t == T - 1) { g_dump_kr_data.assign(kk.begin(), kk.begin() + HKV * HD); }
             for (int k = 0; k < HKV; ++k) {
                 std::copy(kk.begin() + k * HD, kk.begin() + (k + 1) * HD,
                           kv[l].k.begin() + ((size_t) k * (kv[l].k.size() / (HKV * HD)) + kv[l].n_pos) * HD);
@@ -258,8 +275,10 @@ bool forward(Model& m, const std::vector<int>& tokens, int n_layers, std::vector
                 for (int i = 0; i <= kv[l].n_pos; ++i) vis[i] = true;
             }
             mm::attn_one(q.data(), kv[l].k.data(), kv[l].v.data(), vis.get(), m.dims, kv[l].n_pos + 1, aout.data(), kv[l].cap);
+            if (g_dump_da && l == 0 && t == T - 1) { g_dump_da_data.assign(aout.begin(), aout.begin() + H * HD); }
             mm::linear(wo->data(), aout.data(), o.data(), H * HD, NE);
             for (int i = 0; i < NE; ++i) x[t][i] += o[i];
+            if (g_dump_xa && l == 0 && t == T - 1) { std::FILE* f=std::fopen(g_dump_xa,"w"); for(int i=0;i<NE;++i) std::fprintf(f,"%.6f\n",x[t][i]); std::fclose(f); }
             ++kv[l].n_pos;
         }
 
@@ -312,6 +331,7 @@ bool forward(Model& m, const std::vector<int>& tokens, int n_layers, std::vector
                 for (int i = 0; i < NE; ++i) x[t][i] += f[i];
             }
         }
+        if (g_dump_x && l == 0) { std::vector<float> d(NE); for (int i=0;i<NE;++i) d[i]=x[T-1][i]; std::FILE* f=std::fopen(g_dump_x,"w"); for(int i=0;i<NE;++i) std::fprintf(f,"%.6f\n",d[i]); std::fclose(f); }
     }
 
     // final norm + the output head, on the last token
@@ -337,6 +357,7 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
     const int NFF = (int) m.geom.n_ff;
     cudaStream_t st;
     if (cudaStreamCreate(&st) != cudaSuccess) { err = "cudaStreamCreate"; return false; }
+    strata::kernels::pdl_scope() = false;   // PDL needs a PDL predecessor; our custom kernels aren't one, so keep launches ordinary
     auto die = [&](const char* w) -> bool {
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; }
@@ -346,16 +367,22 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
     // device scratch, sized for the largest row (the expert intermediates are the biggest: n_ff)
     std::vector<float> router_host;
     float *dx = nullptr, *dh = nullptr, *dq = nullptr, *dk = nullptr, *dv = nullptr, *da = nullptr, *do_ = nullptr,
-          *dgate = nullptr, *dup = nullptr, *dhh = nullptr, *df = nullptr, *dr = nullptr, *dout = nullptr, *dkv_k = nullptr, *dkv_v = nullptr;
+          *dgate = nullptr, *dup = nullptr, *dhh = nullptr, *df = nullptr, *dr = nullptr, *dout = nullptr, *dkv_k = nullptr, *dkv_v = nullptr,
+          *diq = nullptr, *dik = nullptr, *dikc = nullptr, *dq2 = nullptr, *dk2 = nullptr;
+    unsigned char* dmask = nullptr;
     auto alloc = [&](float** p, size_t n) { return cudaMalloc(p, n * sizeof(float)) == cudaSuccess; };
     if (!alloc(&dx, (size_t) T * NE) || !alloc(&dh, (size_t) NE) || !alloc(&dq, (size_t) H * HD) ||
         !alloc(&dk, (size_t) HKV * HD) || !alloc(&dv, (size_t) HKV * HD) || !alloc(&da, (size_t) H * HD) ||
         !alloc(&do_, (size_t) NE) || !alloc(&dgate, (size_t) NFF) || !alloc(&dup, (size_t) NFF) ||
         !alloc(&dhh, (size_t) NFF) || !alloc(&df, (size_t) NE) || !alloc(&dr, 128) ||
         !alloc(&dout, (size_t) m.geom.n_vocab) || !alloc(&dkv_k, (size_t) HKV * (T + 8) * HD) ||
-        !alloc(&dkv_v, (size_t) HKV * (T + 8) * HD)) { err = "cudaMalloc"; return false; }
+        !alloc(&dkv_v, (size_t) HKV * (T + 8) * HD) ||
+        !alloc(&diq, (size_t) m.idx.n_groups * m.idx.dim) || !alloc(&dik, (size_t) m.idx.dim) ||
+        !alloc(&dikc, (size_t) (T + 8) * m.idx.dim) || !alloc(&dq2, (size_t) H * HD) || !alloc(&dk2, (size_t) HKV * HD) ||
+        cudaMalloc(&dmask, (size_t) (T + 8)) != cudaSuccess) { err = "cudaMalloc"; return false; }
     // Q8_1 scratch (one row of NE and one of NFF)
-    size_t q8ne = K::native_q8_1_bytes(NE, 1), q8nff = K::native_q8_1_bytes(NFF, 1);
+    // hq8 holds the Q8_1 of the largest projection input: the q-k-v use NE, the output uses H*HD (larger)
+    size_t q8ne = K::native_q8_1_bytes((std::max)(NE, H * HD), 1), q8nff = K::native_q8_1_bytes(NFF, 1);
     void *hq8 = nullptr, *hh8 = nullptr;
     if (cudaMalloc(&hq8, q8ne) != cudaSuccess || cudaMalloc(&hh8, q8nff) != cudaSuccess) { err = "cudaMalloc q8"; return false; }
     int32_t* dtok = nullptr;
@@ -393,38 +420,32 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
         const uint8_t* h = m.raw(name, ty, sh, err);
         if (!h) return false;
         const int64_t n = sh.size() >= 2 ? (int64_t) sh[0] * sh[1] : 0;
-        // F32 weights, and Q8_0 (whose iq_mmvq launch is invalid at the small n_out the k/v projections have):
-        // keep / dequant to F32 and use the plain F32 GEMM (exact, no precision loss)
-        if ((Q::Type) ty == Q::Type::F32 || (Q::Type) ty == Q::Type::Q8_0) {
-            std::vector<float> f((size_t) n);
-            if ((Q::Type) ty == Q::Type::F32) std::memcpy(f.data(), h, (size_t) n * sizeof(float));
-            else if (!Q::dequant_row((Q::Type) ty, h, f.data(), (int64_t) n)) return false;
-            w.bytes = (size_t) n * sizeof(float);
-            w.type = (int64_t) Q::Type::F32;
-            if (cudaMalloc(&w.d, w.bytes) != cudaSuccess) return false;
-            cudaMemcpyAsync(w.d, f.data(), w.bytes, cudaMemcpyHostToDevice, st);
-            return true;
-        }
-        w.type = ty;
-        w.bytes = Q::row_bytes((int) ty, n);
+        // TEMPORARY all-F32 path (works around the Q8_1 launch crash at the first sparse layer): dequant every
+        // projection to F32 and use the plain F32 GEMM. Revert to the quantised iq_mmvq once that crash is fixed.
+        std::vector<float> f((size_t) n);
+        if ((Q::Type) ty == Q::Type::F32) std::memcpy(f.data(), h, (size_t) n * sizeof(float));
+        else if (!Q::dequant_row((Q::Type) ty, h, f.data(), (int64_t) n)) return false;
+        w.bytes = (size_t) n * sizeof(float);
+        w.type = (int64_t) Q::Type::F32;
         if (cudaMalloc(&w.d, w.bytes) != cudaSuccess) return false;
-        cudaMemcpyAsync(w.d, h, w.bytes, cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(w.d, f.data(), w.bytes, cudaMemcpyHostToDevice, st);
         return true;
     };
     // dispatch a projection GEMM: F32 weight -> plain F32 matvec (on the F32 activation), else the quantised
     // iq_mmvq (on the Q8_1 activation)
+    auto quant81 = [&](const float* x, void* y, int n) -> bool {
+        try { K::native_quantize_q8_1(x, y, n, 1, st); }
+        catch (const std::exception& e) { std::fprintf(stderr, "  [quant81 throw] n=%d: %s\n", n, e.what()); return false; }
+        return !die("quant81");
+    };
     auto mmf = [&](WProj& w, const float* f32a, const void* q81a, float* y, int n_in, int n_out) -> bool {
-        if (mmf_debug) std::fprintf(stderr, "  [mmf] type=%lld n_in=%d n_out=%d\n", (long long) w.type, n_in, n_out);
-        if (w.type == (int64_t) Q::Type::F32) {
-            m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
-            if (cudaStreamSynchronize(st) != cudaSuccess) { err = "f32_mm: " + std::string(cudaGetErrorString(cudaGetLastError())); return false; }
-        } else {
-            K::iq_mmvq((int) w.type, w.d, q81a, y, n_in, n_out, 1, st);
-        }
+        (void) q81a;   // all-F32 path: the Q8_1 activation is unused
+        m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
         return !die("mmf");
     };
 
     for (int l = 0; l < nL; ++l) {
+        (void)l;
         const std::string p = "blk." + std::to_string(l) + ".";
         const bool sparse = l >= (int) m.geom.n_dense_lead;
         // upload this layer's projections (quantised)
@@ -435,6 +456,17 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
             !up_f32(p + "attn_k_norm.weight", HD, &kn) || !up_f32(p + "ffn_norm.weight", NE, &fn)) {
             err = "layer " + std::to_string(l) + " norms: " + err; return false;
         }
+        // the MSA indexer (sparse layers only): one query head per GQA group, one shared key per position
+        WProj widxq, widxk;
+        float *idxqn = nullptr, *idxkn = nullptr;
+        if (sparse) {
+            if (!up_proj(p + "indexer.q_proj.weight", widxq) || !up_proj(p + "indexer.k_proj.weight", widxk) ||
+                !up_f32(p + "indexer.q_norm.weight", m.idx.dim, &idxqn) || !up_f32(p + "indexer.k_norm.weight", m.idx.dim, &idxkn)) {
+                err = "layer " + std::to_string(l) + " indexer: " + err; return false;
+            }
+        }
+        if (cudaStreamSynchronize(st) != cudaSuccess) { err = "weights upload l=" + std::to_string(l) + ": " + std::string(cudaGetErrorString(cudaGetLastError())); std::fprintf(stderr, "  [upload fail] l=%d\n", l); return false; }
+        if (g_dump_qn && l == 0) { std::vector<float> d(HD); cudaMemcpyAsync(d.data(), qn, (size_t)HD*sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); std::FILE* f=std::fopen(g_dump_qn,"w"); for(int i=0;i<HD;++i) std::fprintf(f,"%.6f\n",d[i]); std::fclose(f); }
         const int cap = T + 8;
         // attention, per token (decode-shaped: one query row at a time)
         for (int t = 0; t < T; ++t) {
@@ -444,34 +476,60 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
             m3k::k_rms<<<gr, 1024, 0, st>>>(xt, an, dh, NE, (float) m.geom.rms_eps);
             if (die("rms1")) return false;
             // qkv
-            K::native_quantize_q8_1(dh, hq8, NE, 1, st);
-            if (l==3&&t==0) std::fprintf(stderr,"  [attn q] type=%lld nout=%d\n",(long long)wq.type,H*HD);
             if (!mmf(wq, dh, hq8, dq, NE, H * HD)) return false;
+            if (g_dump_dq && l == 0 && t == T - 1) { std::vector<float> d((size_t)H*HD); cudaMemcpyAsync(d.data(), dq, (size_t)H*HD*sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); std::FILE* f=std::fopen(g_dump_dq,"w"); for(int i=0;i<H*HD;++i) std::fprintf(f,"%.6f\n",d[i]); std::fclose(f); }
             if (!mmf(wk, dh, hq8, dk, NE, HKV * HD)) return false;
             if (!mmf(wv, dh, hq8, dv, NE, HKV * HD)) return false;
+            if (g_dump_dv && l == 0 && t == T - 1) { std::vector<float> d((size_t)HKV*HD); cudaMemcpyAsync(d.data(), dv, (size_t)HKV*HD*sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); std::FILE* f=std::fopen(g_dump_dv,"w"); for(int i=0;i<HKV*HD;++i) std::fprintf(f,"%.6f\n",d[i]); std::fclose(f); }
             // qk norm (in place, per head): q is H rows of HD, k is HKV rows of HD
-            m3k::k_rms<<<1, H, 0, st>>>(dq, qn, dq, HD, m.dims.eps);
-            m3k::k_rms<<<1, HKV, 0, st>>>(dk, kn, dk, HD, m.dims.eps);
+            m3k::k_rms<<<dim3(1, H), HD, 0, st>>>(dq, qn, dq2, HD, m.dims.eps);
+            m3k::k_rms<<<dim3(1, HKV), HD, 0, st>>>(dk, kn, dk2, HD, m.dims.eps);
             if (die("qknorm")) return false;
-            if (g_dump_q && l == 0 && t == 0) {
-                g_dump_q_data.resize((size_t) H * HD);
-                cudaMemcpyAsync(g_dump_q_data.data(), dq, (size_t) (H * HD) * sizeof(float), cudaMemcpyDeviceToHost, st);
-                cudaStreamSynchronize(st);
-            }
+            if (g_dump_q && l == 0 && t == T - 1) { g_dump_q_data.resize((size_t) H * HD); cudaMemcpyAsync(g_dump_q_data.data(), dq2, (size_t) H * HD * sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); }
             // rope (partial, NEOX)
-            m3k::k_rope<<<H + HKV, (m.dims.n_rot / 2 + 31) / 32, 0, st>>>(dq, dk, H, HKV, HD, m.dims.n_rot, (float) t, m.dims.rope_base);
+            m3k::k_rope<<<H + HKV, m.dims.n_rot / 2, 0, st>>>(dq2, dk2, H, HKV, HD, m.dims.n_rot, (float) t, m.dims.rope_base);
             if (die("rope")) return false;
+            if (g_dump_kr && l == 0 && t == T - 1) { g_dump_kr_data.resize((size_t) HKV * HD); cudaMemcpyAsync(g_dump_kr_data.data(), dk2, (size_t) HKV * HD * sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); }
+            if (g_dump_qr && l == 0 && t == T - 1) { g_dump_qr_data.resize((size_t) H * HD); cudaMemcpyAsync(g_dump_qr_data.data(), dq2, (size_t) H * HD * sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); }
             // append to the KV cache ([heads, cap, HD] layout, matching k_attn)
-            m3k::k_kv_append<<<HKV, HD, 0, st>>>(dkv_k, dk, HKV, HD, cap, t);
+            m3k::k_kv_append<<<HKV, HD, 0, st>>>(dkv_k, dk2, HKV, HD, cap, t);
             m3k::k_kv_append<<<HKV, HD, 0, st>>>(dkv_v, dv, HKV, HD, cap, t);
-            // attention (causal, up to t)
-            m3k::k_attn<<<H, 256, 0, st>>>(dq, dkv_k, dkv_v, da, H, HKV, HD, t + 1, cap, t);
+            if (sparse) {
+                // MSA: the indexer scores the key blocks and the query reads the top-k of them
+                if (!mmf(widxq, dh, hq8, diq, NE, m.idx.n_groups * m.idx.dim)) return false;
+                if (!mmf(widxk, dh, hq8, dik, NE, m.idx.dim)) return false;
+                m3k::k_rms<<<dim3(1, m.idx.n_groups), m.idx.dim, 0, st>>>(diq, idxqn, diq, m.idx.dim, m.dims.eps);
+                m3k::k_rms<<<dim3(1, 1), m.idx.dim, 0, st>>>(dik, idxkn, dik, m.idx.dim, m.dims.eps);
+                m3k::k_rope<<<m.idx.n_groups, m.dims.n_rot / 2, 0, st>>>(diq, nullptr, m.idx.n_groups, 0, m.idx.dim, m.dims.n_rot, (float) t, m.dims.rope_base);
+                m3k::k_rope<<<1, m.dims.n_rot / 2, 0, st>>>(dik, nullptr, 1, 0, m.idx.dim, m.dims.n_rot, (float) t, m.dims.rope_base);
+                if (die("indexer rope")) return false;
+                cudaMemcpyAsync(dikc + (size_t) t * m.idx.dim, dik, (size_t) m.idx.dim * sizeof(float), cudaMemcpyDeviceToDevice, st);
+                // score the blocks and select the top-k (CPU: the indexer key cache is small)
+                const int npos = t + 1, nblk = (npos + m.idx.blk - 1) / m.idx.blk;
+                std::vector<float> ikc((size_t) npos * m.idx.dim), diqh((size_t) m.idx.n_groups * m.idx.dim);
+                cudaMemcpyAsync(ikc.data(), dikc, (size_t) npos * m.idx.dim * sizeof(float), cudaMemcpyDeviceToHost, st);
+                cudaMemcpyAsync(diqh.data(), diq, diqh.size() * sizeof(float), cudaMemcpyDeviceToHost, st);
+                cudaStreamSynchronize(st);
+                std::vector<unsigned char> mask(npos, 0);
+                std::vector<float> scores((size_t) nblk);
+                for (int g = 0; g < m.idx.n_groups; ++g) {
+                    mm::block_scores(diqh.data() + (size_t) g * m.idx.dim, ikc.data(), nullptr, npos, m.idx.dim, m.idx.blk, t, m.idx.local, scores.data());
+                    const mm::BlockSel sel = mm::select_blocks(scores.data(), nblk, m.idx.topk);
+                    for (int j = 0; j < sel.n; ++j)
+                        for (int pp = sel.blocks[j] * m.idx.blk; pp < (sel.blocks[j] + 1) * m.idx.blk && pp < npos; ++pp) mask[pp] = 1;
+                }
+                cudaMemcpyAsync(dmask, mask.data(), (size_t) npos, cudaMemcpyHostToDevice, st);
+                m3k::k_msa_attn<<<H, 256, 0, st>>>(dq2, dkv_k, dkv_v, dmask, da, H, HKV, HD, npos, cap);
+            } else {
+                m3k::k_attn<<<H, 256, 0, st>>>(dq2, dkv_k, dkv_v, da, H, HKV, HD, t + 1, cap, t);
+            }
             if (die("attn")) return false;
+            if (g_dump_da && l == 0 && t == T - 1) { g_dump_da_data.resize((size_t) H * HD); cudaMemcpyAsync(g_dump_da_data.data(), da, (size_t) H * HD * sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); }
             // output projection
-            K::native_quantize_q8_1(da, hq8, H * HD, 1, st);
             if (!mmf(wo, da, hq8, do_, H * HD, NE)) return false;
             m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, do_, NE);
             if (die("add1")) return false;
+            if (g_dump_xa && l == 0 && t == T - 1) { std::vector<float> d(NE); cudaMemcpyAsync(d.data(), xt, (size_t)NE*sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); std::FILE* f=std::fopen(g_dump_xa,"w"); for(int i=0;i<NE;++i) std::fprintf(f,"%.6f\n",d[i]); std::fclose(f); }
         }
         if (cudaStreamSynchronize(st) != cudaSuccess) { err = "attn loop end: " + std::string(cudaGetErrorString(cudaGetLastError())); std::fprintf(stderr, "  [l=%d] attn loop fault\n", l); return false; }
         // FFN
@@ -482,11 +540,9 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
                 float* xt = dx + (size_t) t * NE;
                 dim3 gr((NE + 1023) / 1024, 1);
                 m3k::k_rms<<<gr, 1024, 0, st>>>(xt, fn, dh, NE, (float) m.geom.rms_eps);
-                K::native_quantize_q8_1(dh, hq8, NE, 1, st);
-                if (!mmf(dg, dh, hq8, dgate, NE, NFF)) return false;
+                    if (!mmf(dg, dh, hq8, dgate, NE, NFF)) return false;
                 if (!mmf(du, dh, hq8, dup, NE, NFF)) return false;
                 m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                K::native_quantize_q8_1(dhh, hh8, NFF, 1, st);
                 if (!mmf(dd, dhh, hh8, df, NFF, NE)) return false;
                 m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
                 if (die("dense_ffn")) return false;
@@ -515,14 +571,12 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
                 if (e != cudaSuccess) { err = "devsync: " + std::string(cudaGetErrorString(e)); return false; } }
             // fixed expert-buffer pool (reused for every expert; the stream orders the GEMMs, so no per-expert
             // malloc/free - freeing before the async GEMM finishes would make it read freed memory)
+            // all-F32 path: the expert pool holds one expert's dequantised F32 gate/up/down (streamed one at a time)
             void *exp_g = nullptr, *exp_u = nullptr, *exp_d = nullptr;
             {
-                int64_t ety; uint64_t ebytes; uint64_t dummy;
-                const uint8_t* probe = m.raw_slot(l, 0, "ffn_gate_exps.weight", ety, ebytes, err);
-                (void) probe; (void) dummy;
-                const size_t egsz = Q::row_bytes((int) ety, (int64_t) NE * NFF);
-                if (cudaMalloc(&exp_g, egsz) != cudaSuccess || cudaMalloc(&exp_u, egsz) != cudaSuccess ||
-                    cudaMalloc(&exp_d, Q::row_bytes((int) ety, (int64_t) NFF * NE)) != cudaSuccess) { err = "cudaMalloc expert pool"; return false; }
+                const size_t gu = (size_t) NE * NFF * sizeof(float), dd = (size_t) NFF * NE * sizeof(float);
+                if (cudaMalloc(&exp_g, gu) != cudaSuccess || cudaMalloc(&exp_u, gu) != cudaSuccess ||
+                    cudaMalloc(&exp_d, dd) != cudaSuccess) { err = "cudaMalloc expert pool"; return false; }
             }
             for (int t = 0; t < T; ++t) {
                 float* xt = dx + (size_t) t * NE;
@@ -545,41 +599,44 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
                                   *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
                                   *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
                     if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
-                    cudaMemcpyAsync(exp_g, gh, gb, cudaMemcpyHostToDevice, st);
-                    cudaMemcpyAsync(exp_u, uh, ub, cudaMemcpyHostToDevice, st);
-                    cudaMemcpyAsync(exp_d, dhb, db, cudaMemcpyHostToDevice, st);
-                    K::native_quantize_q8_1(dh, hq8, NE, 1, st);
-                    if (gty == (int64_t) Q::Type::F32) m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_g, dh, dgate, NE, NFF); else K::iq_mmvq((int) gty, exp_g, hq8, dgate, NE, NFF, 1, st); if (die("expert gate")) return false;
-                    if (uty == (int64_t) Q::Type::F32) m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_u, dh, dup, NE, NFF); else K::iq_mmvq((int) uty, exp_u, hq8, dup, NE, NFF, 1, st); if (die("expert up")) return false;
+                    // all-F32: dequant the expert's three matrices to F32 and stream them to the pool
+                    const uint64_t per = (uint64_t) NE * NFF;
+                    std::vector<float> gslot(per), uslot(per), dslot((uint64_t) NFF * NE);
+                    if (!Q::dequant_row((Q::Type) gty, gh, gslot.data(), (int64_t) per) ||
+                        !Q::dequant_row((Q::Type) uty, uh, uslot.data(), (int64_t) per) ||
+                        !Q::dequant_row((Q::Type) dty, dhb, dslot.data(), (int64_t) (NFF * NE))) { err = "expert dequant"; return false; }
+                    cudaMemcpyAsync(exp_g, gslot.data(), gslot.size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                    cudaMemcpyAsync(exp_u, uslot.data(), uslot.size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                    cudaMemcpyAsync(exp_d, dslot.data(), dslot.size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                    m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_g, dh, dgate, NE, NFF); if (die("expert gate")) return false;
+                    m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_u, dh, dup, NE, NFF); if (die("expert up")) return false;
                     m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                    K::native_quantize_q8_1(dhh, hh8, NFF, 1, st);
-                    if (dty == (int64_t) Q::Type::F32) m3k::k_f32_mm<<<(NE + 127) / 128, 128, 0, st>>>((const float*) exp_d, dhh, do_, NFF, NE); else K::iq_mmvq((int) dty, exp_d, hh8, do_, NFF, NE, 1, st); if (die("expert down")) return false;
+                    m3k::k_f32_mm<<<(NE + 127) / 128, 128, 0, st>>>((const float*) exp_d, dhh, do_, NFF, NE); if (die("expert down")) return false;
                     // f += w_s * row
                     float w = r.weights[s];
                     m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, w, NE);
                     if (die("expert")) return false;
                 }
                 // shared expert (weight 1)
-                K::native_quantize_q8_1(dh, hq8, NE, 1, st);
-                if (!mmf(sg, dh, hq8, dgate, NE, NFF)) return false;
+                    if (!mmf(sg, dh, hq8, dgate, NE, NFF)) return false;
                 if (!mmf(su, dh, hq8, dup, NE, NFF)) return false;
                 m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                K::native_quantize_q8_1(dhh, hh8, NFF, 1, st);
                 if (!mmf(sd, dhh, hh8, do_, NFF, NE)) return false;
                 m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, 1.0f, NE);
                 // the weights are already normalised by route(); f is the weighted sum + shared
                 m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
                 if (die("moe_ffn")) return false;
             }
-            cudaFree(exp_g); cudaFree(exp_u); cudaFree(exp_d);
+            cudaFreeAsync(exp_g, st); cudaFreeAsync(exp_u, st); cudaFreeAsync(exp_d, st);
         }
         // NaN guard: find the first layer that produces a non-finite activation
         { std::vector<float> chk(NE); cudaMemcpyAsync(chk.data(), dx + (size_t)(T - 1) * NE, (size_t) NE * sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st);
+          if (g_dump_x && l == 0) { std::FILE* f=std::fopen(g_dump_x,"w"); for(int i=0;i<NE;++i) std::fprintf(f,"%.6f\n",chk[i]); std::fclose(f); }
           bool bad = false; for (int i = 0; i < NE; ++i) if (!std::isfinite(chk[i])) { bad = true; break; }
-          if (bad) { std::fprintf(stderr, "  [nan] first non-finite at layer %d\n", l); return false; } }
+          if (bad) { err = "non-finite activation at layer " + std::to_string(l); return false; } }
         // free this layer's projection weights (the next layer has its own)
-        for (WProj* w : {&wq, &wk, &wv, &wo, &dg, &du, &dd, &wrouter, &sg, &su, &sd}) if (w->d) { cudaFree(w->d); w->d = nullptr; }
-        for (float* f : {an, qn, kn, fn}) if (f) cudaFree(f);
+        for (WProj* w : {&wq, &wk, &wv, &wo, &dg, &du, &dd, &wrouter, &sg, &su, &sd}) if (w->d) { cudaFreeAsync(w->d, st); w->d = nullptr; }
+        for (float* f : {an, qn, kn, fn}) if (f) cudaFreeAsync(f, st);
     }
 
     // final norm + head, on the last token
@@ -589,8 +646,7 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
     if (!up_proj("output.weight", head)) { err = "output head: " + err; return false; }
     float* xt = dx + (size_t) (T - 1) * NE;
     m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, d_on, dh, NE, (float) m.geom.rms_eps);
-    K::native_quantize_q8_1(dh, hq8, NE, 1, st);
-    K::iq_mmvq((int) head.type, head.d, hq8, dout, NE, (int) m.geom.n_vocab, 1, st); if (die("iq_mmvq head")) return false;
+    m3k::k_f32_mm<<<((int) m.geom.n_vocab + 127) / 128, 128, 0, st>>>((const float*) head.d, dh, dout, NE, (int) m.geom.n_vocab); if (die("head")) return false;
     logits.assign((size_t) m.geom.n_vocab, 0.0f);
     cudaMemcpyAsync(logits.data(), dout, (size_t) m.geom.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
@@ -614,7 +670,7 @@ namespace minimax {
 int run(int argc, char** argv) {
     std::string model, tokens;
     int ctx = 8192, n_gen = 64;
-    bool serve = false, use_gpu = true; int n_layers = 0; std::string dump_logits, dump_q;
+    bool serve = false, use_gpu = true; int n_layers = 0; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };
@@ -628,6 +684,14 @@ int run(int argc, char** argv) {
         else if (k == "--layers") { if (!next(v)) return 2; n_layers = std::atoi(v.c_str()); }
         else if (k == "--dump-logits") { if (!next(dump_logits)) return 2; }
         else if (k == "--dump-q") { if (!next(dump_q)) return 2; }
+        else if (k == "--dump-x") { if (!next(dump_x)) return 2; }
+        else if (k == "--dump-xa") { if (!next(dump_xa)) return 2; }
+        else if (k == "--dump-dv") { if (!next(dump_dv)) return 2; }
+        else if (k == "--dump-dq") { if (!next(dump_dq)) return 2; }
+        else if (k == "--dump-qn") { if (!next(dump_qn)) return 2; }
+        else if (k == "--dump-qr") { if (!next(dump_qr)) return 2; }
+        else if (k == "--dump-da") { if (!next(dump_da)) return 2; }
+        else if (k == "--dump-kr") { if (!next(dump_kr)) return 2; }
         else { std::fprintf(stderr, "unknown argument: %s\n", k.c_str()); return 2; }
     }
     if (model.empty()) { std::fprintf(stderr, "usage: strata --native --model <shard> (--serve | --tokens 1,2,3)\n"); return 2; }
@@ -654,9 +718,20 @@ int run(int argc, char** argv) {
         std::vector<float> logits;
         const auto t0 = std::chrono::steady_clock::now();
         g_dump_q = dump_q.empty() ? nullptr : dump_q.c_str();
+        g_dump_x = dump_x.empty() ? nullptr : dump_x.c_str();
+        g_dump_xa = dump_xa.empty() ? nullptr : dump_xa.c_str();
+        g_dump_dv = dump_dv.empty() ? nullptr : dump_dv.c_str();
+        g_dump_dq = dump_dq.empty() ? nullptr : dump_dq.c_str();
+        g_dump_qn = dump_qn.empty() ? nullptr : dump_qn.c_str();
+        g_dump_qr = dump_qr.empty() ? nullptr : dump_qr.c_str();
+        g_dump_da = dump_da.empty() ? nullptr : dump_da.c_str();
+        g_dump_kr = dump_kr.empty() ? nullptr : dump_kr.c_str();
         if (!(use_gpu ? forward_gpu(m, ids, n_layers, logits, err) : forward(m, ids, n_layers, logits, err))) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         if (!dump_logits.empty()) { std::FILE* dl = std::fopen(dump_logits.c_str(), "w"); if (dl) { for (size_t i = 0; i < logits.size(); ++i) std::fprintf(dl, "%.6f\n", logits[i]); std::fclose(dl); } }
         if (!dump_q.empty() && !g_dump_q_data.empty()) { std::FILE* dqf = std::fopen(dump_q.c_str(), "w"); if (dqf) { for (size_t i = 0; i < g_dump_q_data.size(); ++i) std::fprintf(dqf, "%.6f\n", g_dump_q_data[i]); std::fclose(dqf); } }
+        if (!dump_qr.empty() && !g_dump_qr_data.empty()) { std::FILE* drf = std::fopen(dump_qr.c_str(), "w"); if (drf) { for (size_t i = 0; i < g_dump_qr_data.size(); ++i) std::fprintf(drf, "%.6f\n", g_dump_qr_data[i]); std::fclose(drf); } }
+        if (!dump_da.empty() && !g_dump_da_data.empty()) { std::FILE* daf = std::fopen(dump_da.c_str(), "w"); if (daf) { for (size_t i = 0; i < g_dump_da_data.size(); ++i) std::fprintf(daf, "%.6f\n", g_dump_da_data[i]); std::fclose(daf); } }
+        if (!dump_kr.empty() && !g_dump_kr_data.empty()) { std::FILE* krf = std::fopen(dump_kr.c_str(), "w"); if (krf) { for (size_t i = 0; i < g_dump_kr_data.size(); ++i) std::fprintf(krf, "%.6f\n", g_dump_kr_data[i]); std::fclose(krf); } }
         std::vector<int> order(logits.size());
         for (size_t i = 0; i < order.size(); ++i) order[i] = (int) i;
         std::sort(order.begin(), order.end(), [&](int a, int b) { return logits[a] > logits[b]; });

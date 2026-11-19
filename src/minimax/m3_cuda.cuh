@@ -33,8 +33,8 @@ __global__ void k_add(float* __restrict__ x, const float* __restrict__ y, int n)
 __global__ void k_rope(float* __restrict__ q, float* __restrict__ k, int H, int HKV, int HD, int nrot, float t, float base) {
     const int head = blockIdx.x;      // 0..H+HKV-1: 0..H-1 are q heads, H..H+HKV-1 are k heads
     float* v = (head < H ? q + (size_t) head * HD : k + (size_t) (head - H) * HD);
-    if (threadIdx.x * 2 >= nrot) return;
-    const int i = threadIdx.x * 2;
+    if (threadIdx.x >= nrot / 2) return;
+    const int i = threadIdx.x;        // one thread per pair (i, i + nrot/2)
     const float fi = (float) i;
     const float ang = t * exp2f(-2.0f * fi / nrot * log2f(base));   // t * base^(-2i/nrot)
     const float cos = __cosf(ang), sin = __sinf(ang);
@@ -93,9 +93,9 @@ __global__ void k_f32_mm(const float* __restrict__ W, const float* __restrict__ 
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= n_out) return;
     const float* row = W + (size_t) o * n_in;
-    float acc = 0.0f;
-    for (int i = 0; i < n_in; ++i) acc += row[i] * x[i];
-    y[o] = acc;
+    double acc = 0.0;   // double accumulation, matching the CPU reference's `linear` (F32 accum drifts over 60 layers)
+    for (int i = 0; i < n_in; ++i) acc += (double) row[i] * (double) x[i];
+    y[o] = (float) acc;
 }
 
 /// x += s * y, one row of n.
@@ -114,6 +114,47 @@ __global__ void k_scale(float* __restrict__ x, float s, int n) {
     x[base + i] *= s;
 }
 
+/// MSA attention: GQA over an irregular set of visible positions (the indexer's selected blocks), one query row
+/// (H heads). `vis` is npos bytes, 1 on a position to read. Matches strata::minimax::attn_one with a sparse mask.
+__global__ void k_msa_attn(const float* __restrict__ q, const float* __restrict__ kv, const float* __restrict__ vv,
+                           const unsigned char* __restrict__ vis, float* __restrict__ out,
+                           int H, int HKV, int HD, int npos, int cap) {
+    const int h = blockIdx.x;
+    if (h >= H) return;
+    const int hkv = h / (H / HKV);
+    const float* qh = q + (size_t) h * HD;
+    const float* kh = kv + (size_t) hkv * cap * HD;
+    const float* vh = vv + (size_t) hkv * cap * HD;
+    __shared__ int vispos[2048];   // the visible position indices (topk*blk = 16*128)
+    __shared__ float s[2048];
+    __shared__ int nvis;
+    if (threadIdx.x == 0) {
+        int c = 0;
+        for (int p = 0; p < npos; ++p) if (vis[p]) vispos[c++] = p;
+        nvis = c;
+    }
+    __syncthreads();
+    const int nv = nvis;
+    for (int p = threadIdx.x; p < nv; p += blockDim.x) {
+        float d = 0.0f;
+        const float* kp = kh + (size_t) vispos[p] * HD;
+        for (int j = 0; j < HD; ++j) d += qh[j] * kp[j];
+        s[p] = d * rsqrtf((float) HD);
+    }
+    __syncthreads();
+    float mx = -1e30f;
+    for (int p = 0; p < nv; ++p) mx = fmaxf(mx, s[p]);
+    float sum = 0.0f;
+    for (int p = 0; p < nv; ++p) { s[p] = __expf(s[p] - mx); sum += s[p]; }
+    const float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+    __syncthreads();
+    if (threadIdx.x < HD) {
+        float acc = 0.0f;
+        for (int p = 0; p < nv; ++p) acc += s[p] * inv * vh[(size_t) vispos[p] * HD + threadIdx.x];
+        out[(size_t) h * HD + threadIdx.x] = acc;
+    }
+}
+
 /// swiglu_oai: h = min(gate,7)*sigmoid(1.702*min(gate,7)) * (1 + clamp(up,-7,7)), one row of nff.
 __global__ void k_swiglu_oai(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h, int nff) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -121,7 +162,8 @@ __global__ void k_swiglu_oai(const float* __restrict__ gate, const float* __rest
     if (i >= nff) return;
     const float g = fminf(gate[base + i], 7.0f);
     const float u = fminf(fmaxf(up[base + i], -7.0f), 7.0f);
-    h[base + i] = g * __expf(-1.702f * g) / (1.0f + __expf(-1.702f * g)) * (1.0f + u);
+    const float sig = 1.0f / (1.0f + __expf(-1.702f * g));   // sigmoid(1.702 * g)
+    h[base + i] = g * sig * (1.0f + u);
 }
 
 }  // namespace m3k

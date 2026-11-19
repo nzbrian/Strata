@@ -195,3 +195,46 @@ m3_native). It is correct and wired, but slow. The honest answer to "is M3 wired
 7. Product wiring: `setup.py --family minimax`, the model list, capabilities, docs (state it is CPU until 1-6 land).
 
 The CPU engine is a valid fallback and the correctness reference for 6.
+
+## GPU forward is CORRECT (2026-11-19)
+
+The CUDA forward (src/minimax/m3_engine.cu + m3_cuda.cuh) now produces the reference
+token: top-1 **200058** for the "Write one sentence about the Moon." prompt, matching
+the CPU recipe and the reference, consistently.
+
+What is in place and matches the CPU recipe (corr 1.0 on layer 0):
+- The MSA sparse attention (k_msa_attn): the indexer projects to per-group queries and a
+  shared key, RMS-norms and RoPE-rotates them, scores each 128-position block (max of the
+  masked dots, the query's own block and the recent one forced in), selects the top-16,
+  and the query attends to the union of the selected blocks.
+- The GQA causal attention (k_attn), the RMS norms, the partial RoPE, the QK norm, the
+  swiglu_oai FFN, the routed + shared MoE, and the routing.
+- The attention uses an online softmax in double, one thread per output element, in the
+  same order of operations as the CPU attn_one (a two-pass F32 softmax compounded to the
+  wrong token over 60 layers).
+
+Bugs fixed and pinned against the CPU recipe: the swiglu_oai sigmoid sign; the per-head
+RMS-norm and RoPE launches (`<<<1, N>>>` set block.x=N, not grid.y=N); the RoPE loop
+mapped thread i to pair 2i (only even pairs rotated); the in-place QK-norm read-write
+race; the two-pass F32 attention softmax.
+
+The two projection paths (a --quant flag):
+- **default (all-F32)**: dequantise every matrix to F32, plain F32 matvec. CORRECT
+  (200058) but slow (~710 s/token).
+- **--quant**: the quantised iq_mmvq on a Q8_1 activation. Runs without crashing but gives
+  20291 (the Q8_1 activation quantisation compounds over 60 layers) and is not faster.
+
+The speed bottleneck (measured): **1.4 s per token's expert FFN** - dequantise and upload
+the 4 routed experts (904 MB F32) on the fly, 57 sparse layers x 7 tokens. The
+projections are not the bottleneck.
+
+### Remaining for a realistic (fast + correct) run
+1. **The expert cache**: dequantise each expert once and reuse it (per-forward, CPU-RAM
+   LRU, so repeated forwards are warm). A full F32 cache is large (226 MB/expert; the
+   whole stack is ~464 GB F32, so it must be bounded). This is the main lever for speed.
+2. A higher-precision activation for the quantised path (the Q8_1 activations are not
+   accurate enough for the token; F16 activations would be).
+3. Then: batch > 1, the serve-protocol end-to-end on the GPU path, and the product wiring.
+
+The correct (all-F32) path is the default; it is a working, wired, correct M3 CUDA
+engine. It is not yet fast.

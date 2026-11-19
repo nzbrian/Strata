@@ -350,7 +350,7 @@ bool forward(Model& m, const std::vector<int>& tokens, int n_layers, std::vector
 /// activations) and the elementwise / attention work on the m3k kernels. Experts are streamed from the mmap (their
 /// quantised bytes) to the device one at a time - the 95.9 GiB expert stack does not fit in VRAM. Must produce the
 /// same token as the CPU forward.
-bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::vector<float>& logits, std::string& err) {
+bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool use_quant, std::vector<float>& logits, std::string& err) {
     const int T = (int) tokens.size();
     const int nL = n_layers > 0 && n_layers < (int) m.geom.n_layers ? n_layers : (int) m.geom.n_layers;
     const int NE = m.dims.n_embd, H = m.dims.n_head, HKV = m.dims.n_head_kv, HD = m.dims.head_dim;
@@ -420,8 +420,16 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
         const uint8_t* h = m.raw(name, ty, sh, err);
         if (!h) return false;
         const int64_t n = sh.size() >= 2 ? (int64_t) sh[0] * sh[1] : 0;
-        // TEMPORARY all-F32 path (works around the Q8_1 launch crash at the first sparse layer): dequant every
-        // projection to F32 and use the plain F32 GEMM. Revert to the quantised iq_mmvq once that crash is fixed.
+        // quantised path: keep the bytes and let iq_mmvq dequant on the fly; the F32 fallback (the --f32 flag, and
+        // any type iq_mmvq cannot launch) dequantises to F32 and uses the plain F32 matvec
+        if (use_quant && (Q::Type) ty != Q::Type::F32) {
+            w.type = ty;
+            w.bytes = Q::row_bytes((int) ty, n);
+            if (w.bytes == 0) { err = "no row bytes for type " + std::to_string((int) ty); return false; }
+            if (cudaMalloc(&w.d, w.bytes) != cudaSuccess) return false;
+            cudaMemcpyAsync(w.d, h, w.bytes, cudaMemcpyHostToDevice, st);
+            return true;
+        }
         std::vector<float> f((size_t) n);
         if ((Q::Type) ty == Q::Type::F32) std::memcpy(f.data(), h, (size_t) n * sizeof(float));
         else if (!Q::dequant_row((Q::Type) ty, h, f.data(), (int64_t) n)) return false;
@@ -435,12 +443,18 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
     // iq_mmvq (on the Q8_1 activation)
     auto quant81 = [&](const float* x, void* y, int n) -> bool {
         try { K::native_quantize_q8_1(x, y, n, 1, st); }
-        catch (const std::exception& e) { std::fprintf(stderr, "  [quant81 throw] n=%d: %s\n", n, e.what()); return false; }
+        catch (const std::exception& e) { err = std::string("quant81: ") + e.what(); return false; }
         return !die("quant81");
     };
-    auto mmf = [&](WProj& w, const float* f32a, const void* q81a, float* y, int n_in, int n_out) -> bool {
-        (void) q81a;   // all-F32 path: the Q8_1 activation is unused
-        m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
+    // a projection GEMM: quantised weight -> iq_mmvq on the Q8_1 activation; F32 weight -> the plain F32 matvec
+    auto mmf = [&](WProj& w, const float* f32a, void* q81a, float* y, int n_in, int n_out) -> bool {
+        if (w.type == (int64_t) Q::Type::F32) {
+            m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
+            return !die("mmf");
+        }
+        if (!quant81(f32a, q81a, n_in)) return false;
+        try { K::iq_mmvq((int) w.type, w.d, q81a, y, n_in, n_out, 1, st); }
+        catch (const std::exception& e) { err = std::string("mmf: ") + e.what(); return false; }
         return !die("mmf");
     };
 
@@ -646,7 +660,7 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, std::ve
     if (!up_proj("output.weight", head)) { err = "output head: " + err; return false; }
     float* xt = dx + (size_t) (T - 1) * NE;
     m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, d_on, dh, NE, (float) m.geom.rms_eps);
-    m3k::k_f32_mm<<<((int) m.geom.n_vocab + 127) / 128, 128, 0, st>>>((const float*) head.d, dh, dout, NE, (int) m.geom.n_vocab); if (die("head")) return false;
+    if (!mmf(head, dh, hq8, dout, NE, (int) m.geom.n_vocab)) { err = "head: " + err; return false; }
     logits.assign((size_t) m.geom.n_vocab, 0.0f);
     cudaMemcpyAsync(logits.data(), dout, (size_t) m.geom.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
@@ -670,7 +684,7 @@ namespace minimax {
 int run(int argc, char** argv) {
     std::string model, tokens;
     int ctx = 8192, n_gen = 64;
-    bool serve = false, use_gpu = true; int n_layers = 0; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
+    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };
@@ -681,6 +695,7 @@ int run(int argc, char** argv) {
         else if (k == "--n") { if (!next(v)) return 2; n_gen = std::atoi(v.c_str()); }
         else if (k == "--serve") serve = true;
         else if (k == "--cpu") use_gpu = false;
+        else if (k == "--quant") use_quant = true;   // the quantised projection path (faster in principle; see the plan)
         else if (k == "--layers") { if (!next(v)) return 2; n_layers = std::atoi(v.c_str()); }
         else if (k == "--dump-logits") { if (!next(dump_logits)) return 2; }
         else if (k == "--dump-q") { if (!next(dump_q)) return 2; }
@@ -726,7 +741,7 @@ int run(int argc, char** argv) {
         g_dump_qr = dump_qr.empty() ? nullptr : dump_qr.c_str();
         g_dump_da = dump_da.empty() ? nullptr : dump_da.c_str();
         g_dump_kr = dump_kr.empty() ? nullptr : dump_kr.c_str();
-        if (!(use_gpu ? forward_gpu(m, ids, n_layers, logits, err) : forward(m, ids, n_layers, logits, err))) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!(use_gpu ? forward_gpu(m, ids, n_layers, use_quant, logits, err) : forward(m, ids, n_layers, logits, err))) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         if (!dump_logits.empty()) { std::FILE* dl = std::fopen(dump_logits.c_str(), "w"); if (dl) { for (size_t i = 0; i < logits.size(); ++i) std::fprintf(dl, "%.6f\n", logits[i]); std::fclose(dl); } }
         if (!dump_q.empty() && !g_dump_q_data.empty()) { std::FILE* dqf = std::fopen(dump_q.c_str(), "w"); if (dqf) { for (size_t i = 0; i < g_dump_q_data.size(); ++i) std::fprintf(dqf, "%.6f\n", g_dump_q_data[i]); std::fclose(dqf); } }
         if (!dump_qr.empty() && !g_dump_qr_data.empty()) { std::FILE* drf = std::fopen(dump_qr.c_str(), "w"); if (drf) { for (size_t i = 0; i < g_dump_qr_data.size(); ++i) std::fprintf(drf, "%.6f\n", g_dump_qr_data[i]); std::fclose(drf); } }
@@ -794,7 +809,7 @@ int run(int argc, char** argv) {
         std::vector<int> produced;
         for (int g = 0; g < max_new; ++g) {
             std::vector<float> logits;
-            if (!(use_gpu ? forward_gpu(m, ids, 0, logits, err) : forward(m, ids, 0, logits, err))) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
+            if (!(use_gpu ? forward_gpu(m, ids, 0, use_quant, logits, err) : forward(m, ids, 0, logits, err))) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
             int best = 0;
             for (size_t i = 1; i < logits.size(); ++i) if (logits[i] > logits[best]) best = (int) i;
             produced.push_back(best);

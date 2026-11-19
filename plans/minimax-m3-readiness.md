@@ -171,3 +171,27 @@ numerical characteristics. Nothing in the native path is a logic bug.
 `m3_native` has `--dump-vec/--dump-router/--dump-attnin/--dump-logits/--dump-routerw`; `m3run` has `--dump-val
 (comma list)/--dump-full/--dump-logits` plus an eval-callback hook. These are how the per-layer localisation above
 was done. They read tensors back from the GPU via `ggml_backend_tensor_get`.
+
+## Engine wired (2026-11-19)
+
+`src/minimax/m3_engine.cu` is a working, wired Strata engine path for minimax-m3:
+- Loads the GGUF, runs the validated forward, produces the correct next token (top-1 200058 for the
+  "Write one sentence about the Moon." prompt, matching m3_native and the reference).
+- Wired into CMake (`strata_minimax` + `strata-m3`), the family switch in `generate.cpp`
+  (`STRATA_HAVE_MINIMAX`), and `model_family_has_engine(MiniMaxM3)` is now true.
+- Serve protocol (READY / GEN / T / DONE / STOP) works: `GEN 1 <ids>` -> `T 200058` -> `DONE`.
+
+**It is CPU-backed, not GPU-accelerated.** One generated token took 536 s (the CPU forward, same as
+m3_native). It is correct and wired, but slow. The honest answer to "is M3 wired into Strata" is YES;
+"ready to run on GPU (fast)" is NOT YET.
+
+### Remaining for GPU speed (in order)
+1. Upload the weights to the GPU in their quantised form (no F32 dequant of the 95.9 GiB expert stack).
+2. Projections through `strata::kernels::native_mmvq` / `iq_mmvq` (family-neutral, take the quant type).
+3. The expert GEMV through `native_expert` (the routed experts, one weight read per expert for the batch).
+4. The MSA attention kernel (new: block 128, top-16, the indexer dot + max-pool + local bias + top-k + gather).
+5. rms/rope/combine elementwise kernels (cheap).
+6. Test the GPU forward produces the same tokens as the CPU engine (top-1 200058).
+7. Product wiring: `setup.py --family minimax`, the model list, capabilities, docs (state it is CPU until 1-6 land).
+
+The CPU engine is a valid fallback and the correctness reference for 6.

@@ -52,40 +52,33 @@ __global__ void k_kv_append(float* __restrict__ cache, const float* __restrict__
     for (int j = threadIdx.x; j < HD; j += blockDim.x) dst[j] = s[j];
 }
 
-/// GQA causal attention, one query row (H heads) against npos KV positions, out = H x HD. cap is the KV row stride
-/// (the cache capacity). Matches strata::minimax::attn_one.
+/// GQA causal attention, one query row (H heads) against the visible positions 0..qpos, out = H x HD. cap is the KV
+/// row stride (the cache capacity). One thread per output element, an online softmax in double - the same order of
+/// operations as strata::minimax::attn_one, so it matches the CPU recipe.
 __global__ void k_attn(const float* __restrict__ q, const float* __restrict__ kv, const float* __restrict__ vv,
                        float* __restrict__ out, int H, int HKV, int HD, int npos, int cap, int qpos) {
     const int h = blockIdx.x;
-    if (h >= H) return;
+    if (h >= H || threadIdx.x >= HD) return;
     const int hkv = h / (H / HKV);
-    // scores for head h over the visible positions 0..qpos
     const float* qh = q + (size_t) h * HD;
     const float* kh = kv + (size_t) hkv * cap * HD;
-    __shared__ float s[256];
-    const int nvis = qpos + 1;
-    // compute the scores into shared (one thread per position)
-    for (int p = threadIdx.x; p < nvis; p += blockDim.x) {
-        float d = 0.0f;
-        const float* kp = kh + (size_t) p * HD;
-        for (int j = 0; j < HD; ++j) d += qh[j] * kp[j];
-        s[p] = d * rsqrtf((float) HD);
-    }
-    __syncthreads();
-    // softmax over the visible positions
-    float mx = -1e30f;
-    for (int p = 0; p < nvis; ++p) mx = fmaxf(mx, s[p]);
-    float sum = 0.0f;
-    for (int p = 0; p < nvis; ++p) { s[p] = __expf(s[p] - mx); sum += s[p]; }
-    for (int p = 0; p < nvis; ++p) s[p] /= sum;
-    __syncthreads();
-    // weighted sum of the V rows
     const float* vh = vv + (size_t) hkv * cap * HD;
-    if (threadIdx.x < HD) {
-        float acc = 0.0f;
-        for (int p = 0; p < nvis; ++p) acc += s[p] * vh[(size_t) p * HD + threadIdx.x];
-        out[(size_t) h * HD + threadIdx.x] = acc;
+    const int nvis = qpos + 1;
+    const float scale = rsqrtf((float) HD);
+    double m = -1e300, l = 0.0, acc = 0.0;
+    for (int p = 0; p < nvis; ++p) {
+        const float* kp = kh + (size_t) p * HD;
+        double s = 0.0;
+        for (int j = 0; j < HD; ++j) s += (double) qh[j] * kp[j];
+        s *= scale;
+        const double nm = s > m ? s : m;
+        const double corr = (m == -1e300) ? 0.0 : exp(m - nm);
+        const double w = exp(s - nm);
+        m = nm;
+        acc = acc * corr + w * vh[(size_t) p * HD + threadIdx.x];
+        l = l * corr + w;
     }
+    out[(size_t) h * HD + threadIdx.x] = (float) (acc * (l > 0.0 ? 1.0 / l : 0.0));
 }
 
 /// y[o] = sum_i W[o* n_in + i] * x[i], F32 weight (for the few F32 projections, e.g. the k/v of M3).
@@ -115,44 +108,33 @@ __global__ void k_scale(float* __restrict__ x, float s, int n) {
 }
 
 /// MSA attention: GQA over an irregular set of visible positions (the indexer's selected blocks), one query row
-/// (H heads). `vis` is npos bytes, 1 on a position to read. Matches strata::minimax::attn_one with a sparse mask.
+/// (H heads). `vis` is npos bytes, 1 on a position to read. One thread per output element, an online softmax in
+/// double - the same order of operations as strata::minimax::attn_one with a sparse mask, so it matches the CPU.
 __global__ void k_msa_attn(const float* __restrict__ q, const float* __restrict__ kv, const float* __restrict__ vv,
                            const unsigned char* __restrict__ vis, float* __restrict__ out,
                            int H, int HKV, int HD, int npos, int cap) {
     const int h = blockIdx.x;
-    if (h >= H) return;
+    if (h >= H || threadIdx.x >= HD) return;
     const int hkv = h / (H / HKV);
     const float* qh = q + (size_t) h * HD;
     const float* kh = kv + (size_t) hkv * cap * HD;
     const float* vh = vv + (size_t) hkv * cap * HD;
-    __shared__ int vispos[2048];   // the visible position indices (topk*blk = 16*128)
-    __shared__ float s[2048];
-    __shared__ int nvis;
-    if (threadIdx.x == 0) {
-        int c = 0;
-        for (int p = 0; p < npos; ++p) if (vis[p]) vispos[c++] = p;
-        nvis = c;
+    const float scale = rsqrtf((float) HD);
+    double m = -1e300, l = 0.0, acc = 0.0;
+    for (int p = 0; p < npos; ++p) {
+        if (!vis[p]) continue;
+        const float* kp = kh + (size_t) p * HD;
+        double s = 0.0;
+        for (int j = 0; j < HD; ++j) s += (double) qh[j] * kp[j];
+        s *= scale;
+        const double nm = s > m ? s : m;
+        const double corr = (m == -1e300) ? 0.0 : exp(m - nm);
+        const double w = exp(s - nm);
+        m = nm;
+        acc = acc * corr + w * vh[(size_t) p * HD + threadIdx.x];
+        l = l * corr + w;
     }
-    __syncthreads();
-    const int nv = nvis;
-    for (int p = threadIdx.x; p < nv; p += blockDim.x) {
-        float d = 0.0f;
-        const float* kp = kh + (size_t) vispos[p] * HD;
-        for (int j = 0; j < HD; ++j) d += qh[j] * kp[j];
-        s[p] = d * rsqrtf((float) HD);
-    }
-    __syncthreads();
-    float mx = -1e30f;
-    for (int p = 0; p < nv; ++p) mx = fmaxf(mx, s[p]);
-    float sum = 0.0f;
-    for (int p = 0; p < nv; ++p) { s[p] = __expf(s[p] - mx); sum += s[p]; }
-    const float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-    __syncthreads();
-    if (threadIdx.x < HD) {
-        float acc = 0.0f;
-        for (int p = 0; p < nv; ++p) acc += s[p] * inv * vh[(size_t) vispos[p] * HD + threadIdx.x];
-        out[(size_t) h * HD + threadIdx.x] = acc;
-    }
+    out[(size_t) h * HD + threadIdx.x] = (float) (acc * (l > 0.0 ? 1.0 / l : 0.0));
 }
 
 /// swiglu_oai: h = min(gate,7)*sigmoid(1.702*min(gate,7)) * (1 + clamp(up,-7,7)), one row of nff.

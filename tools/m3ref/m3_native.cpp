@@ -177,7 +177,10 @@ int main(int argc, char** argv) {
     std::vector<int> tokens;
     int layers_wanted = 0, top = 5;
     bool report = false;
-    int dump_layer = -1;
+    int dump_layer = -1, dump_router = -1, dump_attnin = -1;
+    std::string dump_logits;
+    int dump_vec = -1;
+    std::string dump_routerw;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };
@@ -197,6 +200,11 @@ int main(int argc, char** argv) {
         else if (k == "--top") { if (!next(v)) return 2; top = std::atoi(v.c_str()); }
         else if (k == "--report") report = true;
         else if (k == "--dump") { if (!next(v)) return 2; dump_layer = std::atoi(v.c_str()); }
+        else if (k == "--dump-router") { if (!next(v)) return 2; dump_router = std::atoi(v.c_str()); }
+        else if (k == "--dump-attnin") { if (!next(v)) return 2; dump_attnin = std::atoi(v.c_str()); }
+        else if (k == "--dump-logits") { if (!next(v)) return 2; dump_logits = v; }
+        else if (k == "--dump-vec") { if (!next(v)) return 2; dump_vec = std::atoi(v.c_str()); }
+        else if (k == "--dump-routerw") { if (!next(v)) return 2; dump_routerw = v; }
         else { std::fprintf(stderr, "unknown argument: %s\n", k.c_str()); return 2; }
     }
     if (model.empty() || tokens.empty()) {
@@ -262,6 +270,10 @@ int main(int argc, char** argv) {
         std::unique_ptr<bool[]> vis(new bool[(size_t) T + 1]);
         for (int t = 0; t < T; ++t) {
             mm::rms_norm(x[t].data(), an->data(), h.data(), NE, (float) m.geom.rms_eps);
+            if (dump_attnin == l + 1 && t == T - 1) {
+                std::printf("natattnin layer %d\n", l + 1);
+                for (int i = 0; i < NE; ++i) std::printf("%.9g\n", h[i]);
+            }
             mm::project_norm_rope(h.data(), m.dims, wq->data(), wk->data(), wv->data(), qn ? qn->data() : nullptr,
                                   kn ? kn->data() : nullptr, (float) t, q.data(), kk.data(), vv.data());
             for (int k = 0; k < HKV; ++k) {
@@ -289,13 +301,43 @@ int main(int argc, char** argv) {
                 // the flat union over groups is what a CPU reference masks with; causality always applies on top
                 for (int i = 0; i < np; ++i) vis[i] = visall[i] && i <= t;
                 vis[kv[l].n_pos] = true;                                              // the token itself is always read
+                if (dump_attnin == l + 1 && t == T - 1) {
+                    std::printf("natmask layer %d: ", l + 1);
+                    for (int i = 0; i < np; ++i) std::printf("%d", vis[i] ? 1 : 0);
+                    std::printf("\n");
+                }
             } else {
                 for (int i = 0; i <= kv[l].n_pos; ++i) vis[i] = true;
             }
             mm::attn_one(q.data(), kv[l].k.data(), kv[l].v.data(), vis.get(), m.dims, kv[l].n_pos + 1, aout.data(),
                             kv[l].cap);   // the cache is strided by its capacity, not by the positions used
+            std::vector<float> qnorm;
+            mm::project_norm_rope(h.data(), m.dims, wq->data(), wk->data(), wv->data(), qn ? qn->data() : nullptr,
+                                  kn ? kn->data() : nullptr, (float) t, q.data(), kk.data(), vv.data(),
+                                  dump_attnin == l + 1 && t == T - 1 ? &qnorm : nullptr);
+            if (dump_attnin == l + 1 && t == T - 1) {
+                std::printf("natqnorm layer %d\n", l + 1);
+                for (float x : qnorm) std::printf("%.9g\n", x);
+                std::printf("natq layer %d\n", l + 1);
+                for (int i = 0; i < H * HD; ++i) std::printf("%.9g\n", q[i]);
+                std::printf("natk layer %d\n", l + 1);
+                for (int i = 0; i < HKV * HD; ++i) std::printf("%.9g\n", kk[i]);
+                std::printf("natv layer %d\n", l + 1);
+                for (int i = 0; i < HKV * HD; ++i) std::printf("%.9g\n", vv[i]);
+                std::printf("nataout layer %d\n", l + 1);
+                for (int i = 0; i < H * HD; ++i) std::printf("%.9g\n", aout[i]);
+            }
             mm::linear(wo->data(), aout.data(), o.data(), H * HD, NE);
+            if (dump_attnin == l + 1 && t == T - 1) {
+                std::printf("nato layer %d\n", l + 1);
+                for (int i = 0; i < NE; ++i) std::printf("%.9g\n", o[i]);
+            }
             for (int i = 0; i < NE; ++i) { x[t][i] += o[i]; if (!std::isfinite(x[t][i])) ++rep.nan_hits; }
+            if (dump_vec == l + 1 && t == T - 1) {
+                std::printf("vec postattn layer %d\n", l + 1);
+                for (int i = 0; i < NE; ++i) std::printf("%.9g\n", x[t][i]);
+            }
+            (void) 0;
             ++kv[l].n_pos;
         }
 
@@ -329,6 +371,10 @@ int main(int argc, char** argv) {
             mw.n_expert = (int) m.geom.n_expert; mw.n_expert_used = (int) m.geom.n_expert_used;
             mw.n_ff = (int) m.geom.n_ff; mw.n_embd = NE; mw.scale = 2.0f; mw.norm = true;
             mw.router = router->data(); mw.bias = bias->data();
+            if (dump_routerw == "blk." + std::to_string(l) + ".ffn_gate_inp.weight") {
+                std::printf("natrouterw %d\n", NE);
+                for (int i = 0; i < NE; ++i) std::printf("%.9g\n", mw.router[i]);
+            }
             mw.sh_gate = sg.data(); mw.sh_up = su.data(); mw.sh_down = sd.data();
         }
         for (int t = 0; t < T; ++t) {
@@ -337,8 +383,16 @@ int main(int argc, char** argv) {
                 mm::ffn_dense(hn.data(), NE, (int) m.geom.n_ff_dense, dg->data(), du->data(), dd->data(), f.data());
             } else {
                 // the four selected experts, dequantised one slot at a time
+                if (dump_attnin == l + 1 && t == T - 1) {
+                    std::printf("nathn layer %d\n", l + 1);
+                    for (int i = 0; i < NE; ++i) std::printf("%.9g\n", hn[i]);
+                }
                 std::vector<float> logits((size_t) mw.n_expert);
                 mm::linear(mw.router, hn.data(), logits.data(), NE, mw.n_expert);
+                if (dump_router == l + 1) {
+                    std::printf("natrouter layer %d n=%d\n", l + 1, mw.n_expert);
+                    for (int e = 0; e < mw.n_expert; ++e) std::printf("%.9g\n", logits[e]);
+                }
                 const mm::Route r = mm::route(logits.data(), mw.bias, mw.n_expert, mw.n_expert_used, true, 2.0f);
                 if (report) {
                     std::vector<float> srt(r.weights, r.weights + r.n);
@@ -365,7 +419,15 @@ int main(int argc, char** argv) {
                 mm::expert_row(hn.data(), NE, mw.n_ff, mw.sh_gate, mw.sh_up, mw.sh_down, hh.data(), row.data());
                 mm::combine(r, rowp.data(), row.data(), NE, f.data());
             }
+            if (dump_vec == l + 1 && t == T - 1) {
+                std::printf("vec ffnout layer %d\n", l + 1);
+                for (int i = 0; i < NE; ++i) std::printf("%.9g\n", f[i]);
+            }
             for (int i = 0; i < NE; ++i) { x[t][i] += f[i]; if (!std::isfinite(x[t][i])) ++rep.nan_hits; }
+            if (dump_vec == l + 1 && t == T - 1) {
+                std::printf("vec postffn layer %d\n", l + 1);
+                for (int i = 0; i < NE; ++i) std::printf("%.9g\n", x[t][i]);
+            }
         }
         if (dump_layer == l + 1) {                                          // the fingerprint a numpy check compares to
             double s = 0.0, q = 0.0;
@@ -396,6 +458,11 @@ int main(int argc, char** argv) {
     std::printf("next token    ");
     for (int i = 0; i < top && i < (int) order.size(); ++i) std::printf("%d(%.4f) ", order[i], logits[order[i]]);
     std::printf("\n");
+    if (!dump_logits.empty()) {
+        FILE* f = std::fopen(dump_logits.c_str(), "w");
+        for (size_t i = 0; i < logits.size(); ++i) std::fprintf(f, "%.9g\n", logits[i]);
+        std::fclose(f);
+    }
     if (report) {
         int used = 0, hot = 0;
         for (int h : rep.expert_hits) { if (h > 0) ++used; if (h > 4) ++hot; }

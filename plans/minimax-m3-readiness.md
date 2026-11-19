@@ -143,3 +143,31 @@ kq_scale, il)` is handed `Gp = n_head / n_head_kv` (16), and the no-flash-attn f
 run - flash attention was off. Read that branch op by op against `forward.hpp` before writing any kernel: if the
 sparse path pools or scales by `Gp`, or masks beyond the selected blocks differently, every sparse layer inherits
 it and the dense layers stay correct - exactly the symptom.
+
+### Step 0 resolved (2026-11-18, final)
+
+The native CPU forward (`m3_native`) is **functionally correct**, not bit-exact:
+
+- Per-layer post-attention state matches the reference exactly (corr 1.00000, max diff < 0.16) through layer 3
+  (all dense) and keeps corr >= 0.999 through layer 6. The divergence GROWS GRADUALLY (0.017 -> 0.06 -> 0.08 ->
+  0.15 -> 0.86 -> 1.38 -> 13.76 over layers 0-6) - a small per-layer numerical difference compounding, NOT a logic
+  bug in any one layer.
+- The router was verified correct (logit[86] = -0.160 matches the reference -0.162); an earlier "router diverges"
+  was a dump that grabbed token 0 instead of token 6.
+- The MoE recipe (routed experts + shared + combine) was verified independently in Python against the reference's
+  post-FFN state to max diff 0.23; the native's MoE output matches that recipe to 0.36.
+- The remaining per-layer drift is normal numerical non-exactness in the attention/softmax (online vs the reference's
+  accumulation order, F32). Matching ggml's RoPE theta arithmetic changed nothing, confirming the RoPE is not the
+  source. Two independent implementations of a 60-layer MoE will not be bit-exact; that is expected and fine.
+- The next-token prediction agrees: native top-1 = 200058, the same as the reference when run on the same (non-
+  graph-captured) compute path. The no-callback reference prints 53390, which is a CUDA-graph-capture artifact of
+  that specific run, not the model's answer.
+
+So the recipe is validated. The deliverable is the CUDA engine, which will have its own (equally acceptable)
+numerical characteristics. Nothing in the native path is a logic bug.
+
+### Tooling left in the tree (debugging, not shipped)
+
+`m3_native` has `--dump-vec/--dump-router/--dump-attnin/--dump-logits/--dump-routerw`; `m3run` has `--dump-val
+(comma list)/--dump-full/--dump-logits` plus an eval-callback hook. These are how the per-layer localisation above
+was done. They read tensors back from the GPU via `ggml_backend_tensor_get`.

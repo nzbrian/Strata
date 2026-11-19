@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstddef>
 #include <vector>
+#include <cstddef>
 
 namespace strata {
 namespace minimax {
@@ -94,21 +95,35 @@ inline void rope_partial(float* v, int n_rot, int n, float pos, float base) {
 /// Project, per-head RMS norm and partial RoPE for one token. `q` gets `n_head * head_dim` floats, `k` and `v` get
 /// `n_head_kv * head_dim` each. The norm is applied to the whole head (128 dims) and RoPE only to its first `n_rot`
 /// dims - in that order, as the reference writes them.
+/// `qnorm_out` (optional) receives the q/k AFTER the per-head RMS norm but BEFORE the RoPE - the split point for
+/// localising a divergence between the norm and the rotation.
 inline void project_norm_rope(const float* h, const LayerDims& d, const float* wq, const float* wk, const float* wv,
-                              const float* wq_norm, const float* wk_norm, float pos, float* q, float* k, float* v) {
+                              const float* wq_norm, const float* wk_norm, float pos, float* q, float* k, float* v,
+                              std::vector<float>* qnorm_out) {
     linear(wq, h, q, d.n_embd, d.n_head * d.head_dim);
     linear(wk, h, k, d.n_embd, d.n_head_kv * d.head_dim);
     linear(wv, h, v, d.n_embd, d.n_head_kv * d.head_dim);
     for (int i = 0; i < d.n_head; ++i) {
         float* qh = q + (size_t) i * d.head_dim;
         rms_norm(qh, wq_norm, qh, d.head_dim, d.eps);
-        rope_partial(qh, d.n_rot, d.head_dim, pos, d.rope_base);
     }
     for (int i = 0; i < d.n_head_kv; ++i) {
         float* kh = k + (size_t) i * d.head_dim;
         rms_norm(kh, wk_norm, kh, d.head_dim, d.eps);
-        rope_partial(kh, d.n_rot, d.head_dim, pos, d.rope_base);
     }
+    if (qnorm_out) {
+        qnorm_out->assign(q, q + (size_t) d.n_head * d.head_dim);
+        qnorm_out->insert(qnorm_out->end(), k, k + (size_t) d.n_head_kv * d.head_dim);
+    }
+    for (int i = 0; i < d.n_head; ++i)
+        rope_partial(q + (size_t) i * d.head_dim, d.n_rot, d.head_dim, pos, d.rope_base);
+    for (int i = 0; i < d.n_head_kv; ++i)
+        rope_partial(k + (size_t) i * d.head_dim, d.n_rot, d.head_dim, pos, d.rope_base);
+}
+
+inline void project_norm_rope(const float* h, const LayerDims& d, const float* wq, const float* wk, const float* wv,
+                              const float* wq_norm, const float* wk_norm, float pos, float* q, float* k, float* v) {
+    project_norm_rope(h, d, wq, wk, wv, wq_norm, wk_norm, pos, q, k, v, nullptr);
 }
 
 /// Grouped-query causal attention for one new query token. `kc`/`vc` hold `n_kv_heads * n_pos * head_dim` floats

@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -43,7 +44,53 @@ struct Args {
     std::string model, prompt = "Hello", override_pattern, override_target;
     int32_t n_gpu_layers = 0, n_ctx = 512, n_batch = 512, n_threads = 0, n_tokens = 32, seed = 1234;
     bool experts_cpu = false, no_mmap = false;
+    std::string dump_val, dump_logits, dump_full;
 };
+
+
+struct TensorDump {
+    std::vector<std::string> targets;     // comma-separated names
+    std::vector<std::string> names;
+    std::vector<std::pair<std::string, std::vector<float>>> values;
+    std::vector<std::string> shapes;
+};
+bool dump_full_cb(struct ggml_tensor* t, bool ask, void* ud) {
+    auto* d = (std::string*) ud;
+    if (ask || !t || !t->name || d->empty()) return true;
+    if (t->name != d->c_str()) return true;
+    int64_t n = 1; for (int i = 0; i < 4; ++i) n *= t->ne[i];
+    std::vector<float> v(n);
+    ggml_backend_tensor_get(t, v.data(), 0, (size_t) n * t->nb[0]);
+    std::printf("FULL %s n=%ld\n", t->name, n);
+    for (int64_t i = 0; i < n; ++i) std::printf("%.6g\n", v[i]);
+    d->clear();   // once
+    return true;
+}
+bool dump_cb(struct ggml_tensor* t, bool ask, void* ud) {
+    auto* d = (TensorDump*) ud;
+    if (ask || !t || !t->name) return true;
+    const std::string n = t->name;
+    // only the FIRST post-compute occurrence of each target
+    for (const auto& tgt : d->targets) {
+        if (n != tgt) continue;
+        bool have = false;
+        for (auto& kv : d->values) if (kv.first == tgt) have = true;
+        if (have) return true;
+        // the token is the last dimension when it is > 1, else dim 1
+        const int rank = (t->ne[2] > 1) ? 3 : 2;
+        const long col = t->ne[rank - 1] - 1;
+        size_t rows = 1;
+        for (int i = 0; i < rank - 1; ++i) rows *= (size_t) t->ne[i];
+        std::vector<float> v(rows);
+        ggml_backend_tensor_get(t, v.data(), (size_t) col * t->nb[rank - 1], rows * t->nb[0]);
+        d->values.emplace_back(tgt, std::move(v));
+        char sh[128]; std::snprintf(sh, sizeof(sh), "%s ne=[%ld,%ld,%ld] rows=%zu col=%ld",
+            n.c_str(), t->ne[0], t->ne[1], t->ne[2], rows, col);
+        d->shapes.push_back(sh);
+        return true;
+    }
+    return true;
+}
 
 std::string slurp(const char* path) {
     FILE* f = std::fopen(path, "rb");
@@ -78,6 +125,9 @@ Args parse(int argc, char** argv) {
         else if (k == "-t" || k == "--threads") a.n_threads = std::atoi(need(i, argc, argv));
         else if (k == "--seed") a.seed = std::atoi(need(i, argc, argv));
         else if (k == "--no-mmap") a.no_mmap = true;
+        else if (k == "--dump-val") a.dump_val = need(i, argc, argv);
+        else if (k == "--dump-logits") a.dump_logits = need(i, argc, argv);
+        else if (k == "--dump-full") a.dump_full = need(i, argc, argv);
         else { std::fprintf(stderr, "unknown argument: %s\n", k.c_str()); std::exit(2); }
     }
     if (a.model.empty()) { std::fprintf(stderr, "--model is required\n"); std::exit(2); }
@@ -135,6 +185,11 @@ int main(int argc, char** argv) {
         cp.n_threads = a.n_threads;
         cp.n_threads_batch = a.n_threads;
     }
+    std::string fulltarget = a.dump_full;
+    if (!a.dump_full.empty()) { cp.cb_eval = dump_full_cb; cp.cb_eval_user_data = &fulltarget; }
+    TensorDump tdump;
+    { std::string s = a.dump_val; size_t p=0; while(p<=s.size()){ size_t c=s.find(',',p); std::string e=s.substr(p,c==std::string::npos?std::string::npos:c-p); if(!e.empty()) tdump.targets.push_back(e); if(c==std::string::npos) break; p=c+1; } }
+    if (!a.dump_val.empty()) { cp.cb_eval = dump_cb; cp.cb_eval_user_data = &tdump; }
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { std::fprintf(stderr, "context failed\n"); return 1; }
     std::printf("ctx                %u tokens, n_batch %d, n_gpu_layers %d%s\n", llama_n_ctx(ctx), a.n_batch,
@@ -146,6 +201,8 @@ int main(int argc, char** argv) {
                                    (int32_t) tokens.size(), /*add_special*/ true, /*parse_special*/ true);
     if (n_tok <= 0) { std::fprintf(stderr, "tokenization failed (%d)\n", n_tok); return 1; }
     tokens.resize(n_tok);
+    std::printf("token ids       ");
+    for (int i = 0; i < n_tok; ++i) std::printf("%d%s", tokens[i], i + 1 < n_tok ? "," : "\n");
 
     const auto tp = std::chrono::steady_clock::now();
     if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tok)) != 0) {
@@ -154,6 +211,28 @@ int main(int argc, char** argv) {
     }
     const double pf_s = since(tp);
     std::printf("prefill            %d tokens in %.3f s = %.2f tok/s\n", n_tok, pf_s, n_tok / (pf_s > 0 ? pf_s : 1e-9));
+    {
+        // the next-token distribution, so a native reimplementation can be compared on logits and not on vibes
+        const float* lg = llama_get_logits_ith(ctx, -1);
+        const int nv = (int) llama_vocab_n_tokens(vocab);
+        std::vector<int> ord(nv);
+        for (int i = 0; i < nv; ++i) ord[i] = i;
+        std::sort(ord.begin(), ord.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+        std::printf("ref top5          ");
+        for (int i = 0; i < 5 && i < nv; ++i) std::printf("%d(%.4f) ", ord[i], lg[ord[i]]);
+        std::printf("\n");
+        if (!a.dump_logits.empty()) {
+            FILE* f = std::fopen(a.dump_logits.c_str(), "w");
+            for (int i = 0; i < nv; ++i) std::fprintf(f, "%.9g\n", lg[i]);
+            std::fclose(f);
+        }
+    }
+    for (size_t i = 0; i < tdump.shapes.size(); ++i) std::printf("SHAPE %s\n", tdump.shapes[i].c_str());
+    for (auto& kv : tdump.values) {
+        std::printf("refval %s n=%zu\n", kv.first.c_str(), kv.second.size());
+        for (size_t i = 0; i < kv.second.size(); ++i)
+            std::printf("%.9g\n", kv.second[i]);
+    }
 
     // greedy: the completion is a reference, and a reference has to be the model rather than a sampler
     llama_sampler* smpl = llama_sampler_init_greedy();

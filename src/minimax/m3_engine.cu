@@ -32,6 +32,7 @@ namespace K = strata::kernels;
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <list>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -158,6 +159,56 @@ class Model {
         shape = t->shape;
         return file_->shard(si).tensor_data(*t);
     }
+    /// One expert's dequantised F32 matrices, from the persistent LRU cache (dequantised once, reused across
+    /// tokens and across forwards, so a warm cache streams over PCIe instead of re-dequantising on the CPU).
+    bool cached_expert(int layer, int expert, int n_embd, int n_ff, std::vector<float>& gate, std::vector<float>& up,
+                       std::vector<float>& down, std::string& err) {
+        const uint64_t key = ((uint64_t) (uint32_t) layer << 32) | (uint64_t) (uint32_t) expert;
+        auto hit = lru_pos_.find(key);
+        if (hit != lru_pos_.end()) {
+            lru_.splice(lru_.begin(), lru_, hit->second);
+            const size_t s = slot_of_.at(key);
+            gate = expert_g_[s]; up = expert_u_[s]; down = expert_d_[s];
+            return true;
+        }
+        // a miss: get a slot (evict the least-recently-used one if the pool is full)
+        size_t slot;
+        if (free_slots_.empty()) {
+            const uint64_t old = lru_.back();
+            slot = slot_of_[old];
+            lru_pos_.erase(old);
+            slot_of_.erase(old);   // the stale entry would let two live keys share a slot
+            lru_.pop_back();
+        } else {
+            slot = free_slots_.back();
+            free_slots_.pop_back();
+        }
+        const size_t gu = (size_t) n_embd * n_ff, dd = (size_t) n_ff * n_embd;
+        int64_t ty; uint64_t by;
+        const uint8_t *gh = raw_slot(layer, expert, "ffn_gate_exps.weight", ty, by, err),
+                      *uh = raw_slot(layer, expert, "ffn_up_exps.weight", ty, by, err),
+                      *dh = raw_slot(layer, expert, "ffn_down_exps.weight", ty, by, err);
+        if (!gh || !uh || !dh) { err = "expert " + std::to_string(expert) + ": " + err; return false; }
+        if (!Q::dequant_row((Q::Type) ty, gh, expert_g_[slot].data(), (int64_t) gu) ||
+            !Q::dequant_row((Q::Type) ty, uh, expert_u_[slot].data(), (int64_t) gu) ||
+            !Q::dequant_row((Q::Type) ty, dh, expert_d_[slot].data(), (int64_t) dd)) { err = "expert dequant"; return false; }
+        lru_.push_front(key); lru_pos_[key] = lru_.begin(); slot_of_[key] = slot;
+        gate = expert_g_[slot]; up = expert_u_[slot]; down = expert_d_[slot];
+        return true;
+    }
+    size_t expert_cache_size() const { return expert_slots_; }
+    /// Size the expert cache: expert_slots_ of (gate, up, down) F32 buffers in CPU RAM.
+    void init_expert_cache(size_t slots, int n_embd, int n_ff) {
+        expert_slots_ = slots;
+        free_slots_.clear();
+        for (size_t i = 0; i < slots; ++i) {
+            expert_g_.emplace_back((size_t) n_embd * n_ff);
+            expert_u_.emplace_back((size_t) n_embd * n_ff);
+            expert_d_.emplace_back((size_t) n_ff * n_embd);
+            free_slots_.push_back(i);
+        }
+    }
+
     /// One expert's quantised bytes from a stacked tensor (the slowest dim is the expert), for GPU upload.
     const uint8_t* raw_slot(int layer, int expert, const char* what, int64_t& type, uint64_t& bytes, std::string& err) {
         const std::string name = "blk." + std::to_string(layer) + "." + what;
@@ -180,6 +231,13 @@ class Model {
   private:
     std::unique_ptr<strata::GgufModel> file_;
     std::unordered_map<std::string, std::vector<float>> cache_;
+    // the persistent F32 expert LRU cache (warm across forwards): expert_slots_ of (gate, up, down)
+    size_t expert_slots_ = 0;
+    std::list<uint64_t> lru_;
+    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_pos_;
+    std::unordered_map<uint64_t, size_t> slot_of_;
+    std::vector<size_t> free_slots_;
+    std::vector<std::vector<float>> expert_g_, expert_u_, expert_d_;
 };
 
 /// The KV cache of one layer, as float rows per KV head, positions appended in order.
@@ -350,7 +408,7 @@ bool forward(Model& m, const std::vector<int>& tokens, int n_layers, std::vector
 /// activations) and the elementwise / attention work on the m3k kernels. Experts are streamed from the mmap (their
 /// quantised bytes) to the device one at a time - the 95.9 GiB expert stack does not fit in VRAM. Must produce the
 /// same token as the CPU forward.
-bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool use_quant, std::vector<float>& logits, std::string& err) {
+bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool use_quant, int expert_cache, std::vector<float>& logits, std::string& err) {
     const int T = (int) tokens.size();
     const int nL = n_layers > 0 && n_layers < (int) m.geom.n_layers ? n_layers : (int) m.geom.n_layers;
     const int NE = m.dims.n_embd, H = m.dims.n_head, HKV = m.dims.n_head_kv, HD = m.dims.head_dim;
@@ -608,12 +666,13 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                 // f = 0; accumulate the routed experts (streamed) and the shared expert
                 cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
                 for (int s = 0; s < r.n; ++s) {
+                    // dequant the expert's three matrices to F32 (fresh per use; the LRU cache is dormant - it
+                    // corrupts the mmap source, see the plan) and stream them to the pool
                     int64_t gty, uty, dty; uint64_t gb, ub, db;
                     const uint8_t *gh = m.raw_slot(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
                                   *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
                                   *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
                     if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
-                    // all-F32: dequant the expert's three matrices to F32 and stream them to the pool
                     const uint64_t per = (uint64_t) NE * NFF;
                     std::vector<float> gslot(per), uslot(per), dslot((uint64_t) NFF * NE);
                     if (!Q::dequant_row((Q::Type) gty, gh, gslot.data(), (int64_t) per) ||
@@ -684,7 +743,7 @@ namespace minimax {
 int run(int argc, char** argv) {
     std::string model, tokens;
     int ctx = 8192, n_gen = 64;
-    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
+    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 850; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };
@@ -696,6 +755,7 @@ int run(int argc, char** argv) {
         else if (k == "--serve") serve = true;
         else if (k == "--cpu") use_gpu = false;
         else if (k == "--quant") use_quant = true;   // the quantised projection path (faster in principle; see the plan)
+        else if (k == "--experts") { if (!next(v)) return 2; expert_cache = std::atoi(v.c_str()); }
         else if (k == "--layers") { if (!next(v)) return 2; n_layers = std::atoi(v.c_str()); }
         else if (k == "--dump-logits") { if (!next(dump_logits)) return 2; }
         else if (k == "--dump-q") { if (!next(dump_q)) return 2; }
@@ -741,7 +801,7 @@ int run(int argc, char** argv) {
         g_dump_qr = dump_qr.empty() ? nullptr : dump_qr.c_str();
         g_dump_da = dump_da.empty() ? nullptr : dump_da.c_str();
         g_dump_kr = dump_kr.empty() ? nullptr : dump_kr.c_str();
-        if (!(use_gpu ? forward_gpu(m, ids, n_layers, use_quant, logits, err) : forward(m, ids, n_layers, logits, err))) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!(use_gpu ? forward_gpu(m, ids, n_layers, use_quant, expert_cache, logits, err) : forward(m, ids, n_layers, logits, err))) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         if (!dump_logits.empty()) { std::FILE* dl = std::fopen(dump_logits.c_str(), "w"); if (dl) { for (size_t i = 0; i < logits.size(); ++i) std::fprintf(dl, "%.6f\n", logits[i]); std::fclose(dl); } }
         if (!dump_q.empty() && !g_dump_q_data.empty()) { std::FILE* dqf = std::fopen(dump_q.c_str(), "w"); if (dqf) { for (size_t i = 0; i < g_dump_q_data.size(); ++i) std::fprintf(dqf, "%.6f\n", g_dump_q_data[i]); std::fclose(dqf); } }
         if (!dump_qr.empty() && !g_dump_qr_data.empty()) { std::FILE* drf = std::fopen(dump_qr.c_str(), "w"); if (drf) { for (size_t i = 0; i < g_dump_qr_data.size(); ++i) std::fprintf(drf, "%.6f\n", g_dump_qr_data[i]); std::fclose(drf); } }
@@ -809,7 +869,7 @@ int run(int argc, char** argv) {
         std::vector<int> produced;
         for (int g = 0; g < max_new; ++g) {
             std::vector<float> logits;
-            if (!(use_gpu ? forward_gpu(m, ids, 0, use_quant, logits, err) : forward(m, ids, 0, logits, err))) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
+            if (!(use_gpu ? forward_gpu(m, ids, 0, use_quant, expert_cache, logits, err) : forward(m, ids, 0, logits, err))) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
             int best = 0;
             for (size_t i = 1; i < logits.size(); ++i) if (logits[i] > logits[best]) best = (int) i;
             produced.push_back(best);

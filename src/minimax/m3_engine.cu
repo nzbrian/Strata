@@ -1409,7 +1409,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                 if (ee != cudaSuccess) { err = std::string(tag) + ": " + cudaGetErrorString(ee); return false; }
                 return true;
             };
-            if (g_mg.n_gpus > 1 && vexp_slots == 0) {
+            if (g_mg.n_gpus > 1) {
                 // ---- multi-GPU expert parallelism ----
                 // The routed experts are split across the GPUs by id % n_gpus.  Phase A enqueues every extra
                 // GPU's work WITHOUT waiting (their PCIe links then run concurrently); phase B computes GPU0's
@@ -1460,7 +1460,20 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                 }
                 for (int s = 0; s < r.n; ++s) {
                     if (g_mg.gpu_of(r.experts[s], g_mg.n_gpus) != 0) continue;
-                    if (!compute_expert(s, pool_g, pool_u, pool_d, dh, dgate, dup, dhh, do_, df, st, "GPU0 expert")) return false;
+                    if (vexp_slots > 0) {
+                        // GPU0's own share through its VRAM expert LRU (hits skip the H2D entirely)
+                        const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
+                        int gty = 0, uty = 0, dty = 0;
+                        if (!g_vexp.get(m, l, r.experts[s], st, &eg, &gty, &eu, &uty, &ed, &dty, err)) {
+                            err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
+                        }
+                        K::iq_mmvq_f32(gty, eg, dh, dgate, NE, NFF, st);
+                        K::iq_mmvq_f32(uty, eu, dh, dup, NE, NFF, st);
+                        m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+                        K::iq_mmvq_f32(dty, ed, dhh, do_, NFF, NE, st);
+                        m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
+                        if (die("vexp")) return false;
+                    } else if (!compute_expert(s, pool_g, pool_u, pool_d, dh, dgate, dup, dhh, do_, df, st, "GPU0 expert")) return false;
                 }
                 // Phase C: wait for the extras, fold their partials into df
                 for (int i = 0; i < (int) g_mg.extra.size(); ++i) {

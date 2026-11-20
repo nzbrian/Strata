@@ -5,6 +5,8 @@ Hardware: 2× RTX 5060 Ti (16 GB, PCIe Gen3 x8, ~6 GB/s pinned H2D measured) + 1
 57 sparse layers × 128 experts, top-4 + 1 shared; 3 leading dense layers).
 
 ## Measured progression (all correct token 200058, Moon prompt, one box)
+**Final: ~2.2 tok/s sustained (50-token generation) - a ~1100x speedup over the 0.002 tok/s
+start, at ~80% of the estimated 2.5-3 tok/s hardware ceiling.**
 
 | Stage | ms/step | tok/s | What changed |
 |---|---|---|---|
@@ -14,21 +16,29 @@ Hardware: 2× RTX 5060 Ti (16 GB, PCIe Gen3 x8, ~6 GB/s pinned H2D measured) + 1
 | + pinned-RAM model staging (112 GB page-locked once) | ~860 | 1.16 | expert H2D 2.93 → 6.02 GB/s (2×), truly async |
 | + 3-GPU expert parallelism (expert e on GPU e%3, phase A/B/C) | ~610 | 1.64 | per-layer expert H2D split across 3 links concurrently |
 | + per-GPU expert VRAM LRU on the extra GPUs (256 slots each) | ~516 @ step 7, falling | **~1.9 warming** | hits skip PCIe entirely; routed section decays 366→159 ms over 7 steps |
-| Sustained, 50-token generation (P up to 55) | ~540 | **~1.85** | extra-GPU LRUs at steady hit rate (routed ~130 ms); attn/router grow with context |
+| + GPU0's expert LRU inside the multi-GPU path | ~455 | **~2.2** | GPU0 LRU 67% hit; its 1/3 expert-ID space fits 128 slots |
+| + 20 MB slots (was 32 MB), 384 extra-GPU slots default | ~445 | **~2.2** | ~60% more cached instances in the same VRAM; GPU1/GPU2 ~86% hit |
 
-## Where the step time goes (3-GPU + LRU, step P=7, M3_TPROFILE)
-- attn ~269 ms (includes ~100 ms of queue-flush artifact; true attention compute ~171 ms)
-- router ~74 ms (D2H scores + host top-k + stream sync, 1.2 ms/layer)
-- routed experts ~159 ms and falling (extra-GPU LRU warming; cold = 366 ms)
+## Where the step time goes (3-GPU + all-LRU, step P~55, M3_TPROFILE)
+- attn ~180-195 ms + router ~127-138 ms ≈ 310-330 ms combined: this is **two full GPU-stream
+  drains per sparse layer** - the MSA indexer D2Hs the key cache + host-scores blocks +
+  `cudaStreamSynchronize`, then the router D2Hs scores + host top-k + `cudaStreamSynchronize`.
+  Each drain serializes the GPU's attention compute (q/k/v/o GEMV + attention + indexer), paid
+  57x/token. The "attn" wall time is CPU launch + the indexer drain wait; the "router" wall time
+  is the router drain wait + host top-k. Both grow slowly with context (MSA reads more blocks).
+- routed experts ~110-123 ms (cache-aware: GPU0 LRU 67% hit, GPU1/GPU2 LRU ~86% hit; the rest is
+  miss-streaming at 6 GB/s + the relay/sync overhead, inherent to host-mediated dispatch)
 - shared expert ~1.7 ms, output head ~12 ms
+- Cache hit rates are high because the greedy base-model generation falls into a repetition loop
+  whose activations keep the router selecting a recurring expert subset (good locality).
 
 ## The honest ceiling (corrects the earlier "~10 tok/s")
 Per token ~3 GB of routed-expert weights must be read. With 3 concurrent PCIe links + VRAM
 caches of the hot experts, the floor is roughly: attention compute (~170 ms, serial at batch 1)
 + router sync (~70 ms) + remaining expert streaming/GEMV (~70 ms when warm) ≈ 0.35-0.45 s/token
-≈ **2.5-3 tok/s**. We are at ~1.9 and rising with warmup. 10 tok/s is not physically reachable
-on this box (would need ~30 GB/s effective expert-weight bandwidth; layers are sequential at
-batch 1, so attention stays serial).
+≈ **2.5-3 tok/s**. We are at ~2.2 sustained. 10 tok/s is not physically reachable on this box
+(would need ~30 GB/s effective expert-weight bandwidth; layers are sequential at batch 1, so
+attention stays serial).
 
 ## Key findings (measured, not estimated)
 - The routed-expert time is **H2D streaming**, not GEMV compute: iq_mmvq_f32 runs at 111-128
@@ -56,18 +66,19 @@ batch 1, so attention stays serial).
 - [x] P2 per-GPU expert VRAM LRU on the extra GPUs (--expslots N, default 256).
 
 ## Remaining (diminishing returns; the ceiling is ~2.5-3 tok/s)
-- [x] Warm-state measurement over a 50-token generation (P up to 55): **sustained ~1.85 tok/s**
-      (step ~540 ms). The routed section plateaus ~125-135 ms once the extra-GPU LRUs reach
-      steady hit rate; attn grows slowly to ~270-290 ms and router to ~125-135 ms as context
-      lengthens (MSA reads more selected blocks; the router's stream-sync flushes more queued
-      expert work). Both are context-length effects, not regressions.
-- [ ] Faster attention path (the last ~170 ms of serial compute; multi-hour kernel work).
-- [ ] Router without the host sync (port mm::route's top-k to a GPU kernel; saves ~70 ms).
+Both remaining levers are multi-hour efforts for +0.3-0.5 tok/s:
+- [ ] **Tensor-parallel the q/o GEMVs** across the 3 GPUs (split output rows; relay ~100 KB/layer
+      back). Cuts the serialized attention GPU compute ~2/3 for those two GEMVs -> ~40-80 ms/token
+      -> ~2.5-2.7 tok/s. Moderate refactor (weights on 3 GPUs, device-aware GEMV dispatch).
+- [ ] **Fused GPU-side MoE dispatch + GPU-side MSA block selection** (no host round trip). Would
+      eliminate the two per-layer stream drains (the bulk of the 310 ms attn+router) but is a large,
+      high-risk kernel effort (dynamic expert dispatch reading quantised weights in VRAM/pinned RAM).
 - [ ] Fix the pre-existing `free(): double free` at process exit after a serve run
       (cosmetic; all tokens are produced before it).
 
 ## Flags
 `--quant` (required for the fast path) `--gpus N` (default 3) `--expslots N` (extra-GPU LRU
-slots, default 256 ≈ 8 GB arena each) `--vexperts N` (GPU0's expert LRU slots) `--ctx N`
+slots, default 384 ≈ 7.5 GB arena each at 20 MB/slot) `--vexperts N` (GPU0's expert LRU slots,
+20 MB each) `--ctx N`
 (M3_NOSTAGE=1 env: skip the one-time pinned-RAM staging) `M3_TPROFILE=1` env: per-section
 step timing.

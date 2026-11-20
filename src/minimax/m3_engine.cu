@@ -519,15 +519,15 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
         catch (const std::exception& e) { err = std::string("quant81: ") + e.what(); return false; }
         return !die("quant81");
     };
-    // a projection GEMM: quantised weight -> iq_mmvq on the Q8_1 activation; F32 weight -> the plain F32 matvec
+    // a projection GEMM: F32 weight -> the plain F32 matvec; quantised weight -> iq_mmvq_f32 on the FLOAT
+    // activation (iq_mmvq's Q8_1 activation is not accurate over 60 MoE layers - it compounds to the wrong token)
     auto mmf = [&](WProj& w, const float* f32a, void* q81a, float* y, int n_in, int n_out) -> bool {
+        (void) q81a;
         if (w.type == (int64_t) Q::Type::F32) {
             m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
             return !die("mmf");
         }
-        if (!quant81(f32a, q81a, n_in)) return false;
-        try { K::iq_mmvq((int) w.type, w.d, q81a, y, n_in, n_out, 1, st); }
-        catch (const std::exception& e) { err = std::string("mmf: ") + e.what(); return false; }
+        K::iq_mmvq_f32((int) w.type, w.d, f32a, y, n_in, n_out, st);
         return !die("mmf");
     };
 
@@ -658,9 +658,14 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                 if (e != cudaSuccess) { err = "devsync: " + std::string(cudaGetErrorString(e)); return false; } }
             // fixed expert-buffer pool (reused for every expert; the stream orders the GEMMs, so no per-expert
             // malloc/free - freeing before the async GEMM finishes would make it read freed memory)
-            // all-F32 path: the expert pool holds one expert's dequantised F32 gate/up/down (streamed one at a time)
+            // all-F32 path: one expert's dequantised F32 matrices (~226 MB each); quant path: one expert's raw
+            // quantised bytes (~4-12 MB each), dequantised on the GPU by iq_mmvq_f32
             void *exp_g = nullptr, *exp_u = nullptr, *exp_d = nullptr;
-            {
+            if (use_quant) {
+                const size_t qgu = (size_t) NFF * 4096, qd = (size_t) NE * 4096;   // room for any type's row bytes
+                if (cudaMalloc(&exp_g, qgu) != cudaSuccess || cudaMalloc(&exp_u, qgu) != cudaSuccess ||
+                    cudaMalloc(&exp_d, qd) != cudaSuccess) { err = "cudaMalloc expert pool (quant)"; return false; }
+            } else {
                 const size_t gu = (size_t) NE * NFF * sizeof(float), dd = (size_t) NFF * NE * sizeof(float);
                 if (cudaMalloc(&exp_g, gu) != cudaSuccess || cudaMalloc(&exp_u, gu) != cudaSuccess ||
                     cudaMalloc(&exp_d, dd) != cudaSuccess) { err = "cudaMalloc expert pool"; return false; }
@@ -681,38 +686,56 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                 // f = 0; accumulate the routed experts (streamed) and the shared expert
                 cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
                 for (int s = 0; s < r.n; ++s) {
-                    // the expert's three matrices to F32, streamed to the pool.  With --experts N this is the
-                    // persistent LRU (dequantised once, then the cached slot is re-streamed over PCIe); without it,
-                    // a fresh dequant per use.  Sync first so a prior async copy out of a slot is done before this
-                    // call may evict and overwrite it.
-                    if (cudaStreamSynchronize(st) != cudaSuccess) { err = "expert cache sync"; return false; }
-                    const std::vector<float> *gslot, *uslot, *dslot;
-                    if (expert_cache > 0) {
-                        if (!m.cached_expert(l, r.experts[s], NE, NFF, &gslot, &uslot, &dslot, err)) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
-                    } else {
+                    if (use_quant) {
+                        // stream the expert's raw quantised bytes to the pool (a few MB, ~15x less than the F32
+                        // matrices) and run the quant-weight x float-activation GEMV on the GPU
                         int64_t gty, uty, dty; uint64_t gb, ub, db;
                         const uint8_t *gh = m.raw_slot(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
                                       *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
                                       *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
                         if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
-                        const uint64_t per = (uint64_t) NE * NFF;
-                        fresh_g_.resize(per); fresh_u_.resize(per); fresh_d_.resize((uint64_t) NFF * NE);   // dequant overwrites all
-                        if (!Q::dequant_row((Q::Type) gty, gh, fresh_g_.data(), (int64_t) per) ||
-                            !Q::dequant_row((Q::Type) uty, uh, fresh_u_.data(), (int64_t) per) ||
-                            !Q::dequant_row((Q::Type) dty, dhb, fresh_d_.data(), (int64_t) (NFF * NE))) { err = "expert dequant"; return false; }
-                        gslot = &fresh_g_; uslot = &fresh_u_; dslot = &fresh_d_;
+                        cudaMemcpyAsync(exp_g, gh, (size_t) gb, cudaMemcpyHostToDevice, st);
+                        cudaMemcpyAsync(exp_u, uh, (size_t) ub, cudaMemcpyHostToDevice, st);
+                        cudaMemcpyAsync(exp_d, dhb, (size_t) db, cudaMemcpyHostToDevice, st);
+                        K::iq_mmvq_f32((int) gty, exp_g, dh, dgate, NE, NFF, st); if (die("expert gate")) return false;
+                        K::iq_mmvq_f32((int) uty, exp_u, dh, dup, NE, NFF, st); if (die("expert up")) return false;
+                        m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+                        K::iq_mmvq_f32((int) dty, exp_d, dhh, do_, NFF, NE, st); if (die("expert down")) return false;
+                        m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
+                        if (die("expert")) return false;
+                    } else {
+                        // the expert's three matrices to F32, streamed to the pool.  With --experts N this is the
+                        // persistent LRU (dequantised once, then the cached slot is re-streamed over PCIe); without
+                        // it, a fresh dequant per use.  Sync first so a prior async copy out of a slot is done before
+                        // this call may evict and overwrite it.
+                        if (cudaStreamSynchronize(st) != cudaSuccess) { err = "expert cache sync"; return false; }
+                        const std::vector<float> *gslot, *uslot, *dslot;
+                        if (expert_cache > 0) {
+                            if (!m.cached_expert(l, r.experts[s], NE, NFF, &gslot, &uslot, &dslot, err)) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
+                        } else {
+                            int64_t gty, uty, dty; uint64_t gb, ub, db;
+                            const uint8_t *gh = m.raw_slot(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
+                                          *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
+                                          *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
+                            if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
+                            const uint64_t per = (uint64_t) NE * NFF;
+                            fresh_g_.resize(per); fresh_u_.resize(per); fresh_d_.resize((uint64_t) NFF * NE);   // dequant overwrites all
+                            if (!Q::dequant_row((Q::Type) gty, gh, fresh_g_.data(), (int64_t) per) ||
+                                !Q::dequant_row((Q::Type) uty, uh, fresh_u_.data(), (int64_t) per) ||
+                                !Q::dequant_row((Q::Type) dty, dhb, fresh_d_.data(), (int64_t) (NFF * NE))) { err = "expert dequant"; return false; }
+                            gslot = &fresh_g_; uslot = &fresh_u_; dslot = &fresh_d_;
+                        }
+                        cudaMemcpyAsync(exp_g, gslot->data(), gslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                        cudaMemcpyAsync(exp_u, uslot->data(), uslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                        cudaMemcpyAsync(exp_d, dslot->data(), dslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                        m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_g, dh, dgate, NE, NFF); if (die("expert gate")) return false;
+                        m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_u, dh, dup, NE, NFF); if (die("expert up")) return false;
+                        m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+                        m3k::k_f32_mm<<<(NE + 127) / 128, 128, 0, st>>>((const float*) exp_d, dhh, do_, NFF, NE); if (die("expert down")) return false;
+                        // f += w_s * row
+                        m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
+                        if (die("expert")) return false;
                     }
-                    cudaMemcpyAsync(exp_g, gslot->data(), gslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
-                    cudaMemcpyAsync(exp_u, uslot->data(), uslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
-                    cudaMemcpyAsync(exp_d, dslot->data(), dslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
-                    m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_g, dh, dgate, NE, NFF); if (die("expert gate")) return false;
-                    m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_u, dh, dup, NE, NFF); if (die("expert up")) return false;
-                    m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                    m3k::k_f32_mm<<<(NE + 127) / 128, 128, 0, st>>>((const float*) exp_d, dhh, do_, NFF, NE); if (die("expert down")) return false;
-                    // f += w_s * row
-                    float w = r.weights[s];
-                    m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, w, NE);
-                    if (die("expert")) return false;
                 }
                 // shared expert (weight 1)
                     if (!mmf(sg, dh, hq8, dgate, NE, NFF)) return false;

@@ -654,7 +654,7 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
     if (expert_cache > 0) m.init_expert_cache((size_t) expert_cache, NE, NFF);
     // the VRAM expert LRU (opt-in via --vexperts N on the quant path); 32 MB per slot covers this model's experts
     // (~13 MB) with room for the file's widest type
-    if (use_quant && vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) {
+    if (use_quant && vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 20u << 20)) {
         err = "vexp arena allocation failed"; return false;
     }
     // stage the model in pinned RAM for fast expert H2D (one-time; M3_NOSTAGE=1 disables)
@@ -1088,8 +1088,10 @@ bool m3_multigpu_init(int NE, int NFF, bool use_quant, int n_gpus, int expslots,
             cudaMalloc(&E.h, (size_t) NE * sizeof(float)) != cudaSuccess) {
             err = "extra GPU allocation (device " + std::to_string(dev) + ")"; return false;
         }
-        // this GPU's expert LRU: the extra GPUs hold no resident weights, so most of their VRAM is cache
-        if (!E.cache.init((size_t) expslots, 32u << 20, dev)) {
+        // this GPU's expert LRU: the extra GPUs hold no resident weights, so most of their VRAM is cache.
+        // 20 MB per slot fits this model's largest expert (16.4 MB, IQ2_XS gate/up/down) without the 2.4x
+        // waste of a 32 MB slot, so the same VRAM holds ~60% more cached instances.
+        if (!E.cache.init((size_t) expslots, 20u << 20, dev)) {
             err = "extra GPU expert cache (device " + std::to_string(dev) + ")"; return false;
         }
     }
@@ -1262,7 +1264,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
     const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD, NFF = ds.NFF;
     const int P = ds.n_pos;
     if (P >= ds.cap) { err = "context length exceeded (" + std::to_string(P) + ")"; return false; }
-    if (vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) { err = "vexp arena"; return false; }
+    if (vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 20u << 20)) { err = "vexp arena"; return false; }
 
     cudaStream_t st;
     if (cudaStreamCreate(&st) != cudaSuccess) { err = "cudaStreamCreate"; return false; }
@@ -1572,7 +1574,7 @@ namespace minimax {
 int run(int argc, char** argv) {
     std::string model, tokens;
     int ctx = 8192, n_gen = 64;
-    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 0; int vexp_slots = 0; int n_gpus = 3; int expslots = 256; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
+    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 0; int vexp_slots = 0; int n_gpus = 3; int expslots = 384; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };
@@ -1763,9 +1765,20 @@ int run(int argc, char** argv) {
         }
         if (use_gpu && use_quant && vexp_slots > 0) {
             const uint64_t t_use = g_vexp.hits + g_vexp.misses;
-            std::fprintf(stderr, "vexp cache    %zu slots, %zu pinned, %llu/%llu total uses hit (%.1f%%)\n",
+            std::fprintf(stderr, "vexp cache    GPU0 %zu slots, %zu pinned, %llu/%llu uses hit (%.1f%%)\n",
                          g_vexp.n_slots, g_vexp.pinned.size(), (unsigned long long) g_vexp.hits,
                          (unsigned long long) t_use, t_use ? 100.0 * (double) g_vexp.hits / (double) t_use : 0.0);
+            std::fflush(stderr);
+        }
+        if (use_gpu && use_quant) {
+            for (size_t i = 0; i < g_mg.extra.size(); ++i) {
+                const auto& C = g_mg.extra[i].cache;
+                const uint64_t t_use = C.hits + C.misses;
+                if (C.n_slots == 0 || t_use == 0) continue;
+                std::fprintf(stderr, "vexp cache    GPU%d %zu slots, %zu pinned, %llu/%llu uses hit (%.1f%%)\n",
+                             g_mg.extra[i].dev, C.n_slots, C.pinned.size(), (unsigned long long) C.hits,
+                             (unsigned long long) t_use, 100.0 * (double) C.hits / (double) t_use);
+            }
             std::fflush(stderr);
         }
         std::printf("DONE %d %zu %.1f 0.0 %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", (long long) produced.size(), ids.size(),

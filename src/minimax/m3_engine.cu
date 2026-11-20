@@ -1033,6 +1033,66 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
 }
 
 // ===========================================================================
+// Multi-GPU expert runner: the routed experts of a sparse layer are split across the GPUs by
+// expert id (expert e runs on GPU e % n_gpus).  Each extra GPU streams its share of the expert
+// bytes from pinned RAM over its OWN PCIe link, in parallel with GPU0's attention/router/shared
+// work - the single-GPU bottleneck is one link carrying all ~3 GB/token of expert bytes.
+// Activations and partial outputs cross via small pinned host relay buffers (24 KB each).
+// ===========================================================================
+struct M3MultiGpu {
+    int n_gpus = 1;                 // GPUs used (1 = single-GPU mode)
+    struct Extra {
+        int dev = -1;
+        void *pool_g = nullptr, *pool_u = nullptr, *pool_d = nullptr;   // one expert's quantised bytes
+        float *dgate = nullptr, *dup = nullptr, *dhh = nullptr, *do_ = nullptr, *df = nullptr, *h = nullptr;
+        cudaStream_t st = nullptr;
+    };
+    std::vector<Extra> extra;       // extra[i] = GPU i+1
+    float *relay_h = nullptr;       // pinned: activation GPU0 -> extras (NE floats)
+    float *relay_out = nullptr;     // pinned: partial outputs extras -> GPU0 ((n-1)*NE floats)
+    bool ready = false;
+
+    static int gpu_of(int expert, int n_gpus) { return n_gpus <= 1 ? 0 : (expert % n_gpus); }
+};
+static M3MultiGpu g_mg;
+
+bool m3_multigpu_init(int NE, int NFF, bool use_quant, int n_gpus, std::string& err) {
+    if (g_mg.ready) return true;
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) { err = "cudaGetDeviceCount"; return false; }
+    if (n_gpus > devices) n_gpus = devices;
+    g_mg.n_gpus = n_gpus;
+    if (n_gpus <= 1) return true;   // single-GPU mode: nothing to set up
+    const size_t need_gu = use_quant ? (size_t) NFF * 4096 : (size_t) NFF * (size_t) NE * sizeof(float);
+    const size_t need_d = use_quant ? (size_t) NE * 4096 : (size_t) NE * (size_t) NFF * sizeof(float);
+    g_mg.extra.resize(n_gpus - 1);
+    for (int i = 0; i < n_gpus - 1; ++i) {
+        const int dev = i + 1;
+        cudaSetDevice(dev);
+        auto& E = g_mg.extra[i];
+        E.dev = dev;
+        if (cudaStreamCreate(&E.st) != cudaSuccess) { err = "extra stream"; return false; }
+        if (cudaMalloc(&E.pool_g, need_gu) != cudaSuccess || cudaMalloc(&E.pool_u, need_gu) != cudaSuccess ||
+            cudaMalloc(&E.pool_d, need_d) != cudaSuccess ||
+            cudaMalloc(&E.dgate, (size_t) NFF * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.dup, (size_t) NFF * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.dhh, (size_t) NFF * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.do_, (size_t) NE * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.df, (size_t) NE * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.h, (size_t) NE * sizeof(float)) != cudaSuccess) {
+            err = "extra GPU allocation (device " + std::to_string(dev) + ")"; return false;
+        }
+    }
+    cudaSetDevice(0);
+    if (cudaHostAlloc(&g_mg.relay_h, (size_t) NE * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
+        cudaHostAlloc(&g_mg.relay_out, (size_t) (n_gpus - 1) * NE * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+        err = "relay allocation"; return false;
+    }
+    g_mg.ready = true;
+    return true;
+}
+
+// ===========================================================================
 // Decode engine: resident projection weights + a persistent KV cache + single-token steps.
 //
 // The batched forward re-uploads ~7.5 GB of projection weights on every call and recomputes the whole prefix
@@ -1056,6 +1116,7 @@ struct M3DecodeState {
     float* out_norm = nullptr;
     float *dkv_k = nullptr, *dkv_v = nullptr;   // [nL][HKV][cap][HD] each
     float* didxc = nullptr;                      // [n_sparse][cap][idx.dim]
+    float* d_part = nullptr;                     // multi-GPU: one extra GPU's partial output (NE floats, GPU0)
     int cap = 0, n_pos = 0;
     int NE = 0, n_head = 0, HKV = 0, HD = 0, NFF = 0, nL = 0, dense_lead = 0, n_sparse = 0;
     int idx_dim = 0, idx_groups = 0, idx_blk = 0, idx_topk = 0, idx_local = 0;
@@ -1076,11 +1137,15 @@ void m3_decode_free(M3DecodeState& ds) {
     if (ds.dkv_k) { cudaFree(ds.dkv_k); ds.dkv_k = nullptr; }
     if (ds.dkv_v) { cudaFree(ds.dkv_v); ds.dkv_v = nullptr; }
     if (ds.didxc) { cudaFree(ds.didxc); ds.didxc = nullptr; }
+    if (ds.d_part) { cudaFree(ds.d_part); ds.d_part = nullptr; }
     ds.n_pos = 0; ds.ready = false;
 }
 
-bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, std::string& err) {
+bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_gpus, std::string& err) {
     if (ds.ready) m3_decode_free(ds);
+    // multi-GPU expert runner (extra GPUs compute their share of the routed experts in parallel)
+    const int NE0 = m.dims.n_embd, NFF0 = (int) m.geom.n_ff;
+    if (use_quant && !m3_multigpu_init(NE0, NFF0, true, n_gpus, err)) return false;
     // stage the model in pinned RAM so expert H2D runs at the pinned rate (one-time, ~file-size / CPU-copy
     // speed); M3_NOSTAGE=1 disables it (experts then stream from the pageable mmap)
     if (use_quant && !g_pinned_model.ready && getenv("M3_NOSTAGE") == nullptr) {
@@ -1171,7 +1236,8 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, std::s
     if (!upload_f32("output_norm.weight", NE, &ds.out_norm)) { err = "output_norm.weight"; return false; }
     if (cudaMalloc(&ds.dkv_k, (size_t) nL * HKV * cap * HD * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&ds.dkv_v, (size_t) nL * HKV * cap * HD * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&ds.didxc, (size_t) ds.n_sparse * cap * m.idx.dim * sizeof(float)) != cudaSuccess) {
+        cudaMalloc(&ds.didxc, (size_t) ds.n_sparse * cap * m.idx.dim * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&ds.d_part, (size_t) NE * sizeof(float)) != cudaSuccess) {
         err = "KV cache allocation"; return false;
     }
     ds.ready = true;
@@ -1310,47 +1376,109 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             mw.n_expert = (int) m.geom.n_expert; mw.n_expert_used = (int) m.geom.n_expert_used;
             mw.n_ff = NFF; mw.n_embd = NE; mw.scale = 2.0f; mw.norm = true;
             const mm::Route r = mm::route(scores.data(), bias_host.data(), mw.n_expert, mw.n_expert_used, true, 2.0f);
-            // f = 0; accumulate the routed experts (VRAM LRU when --vexperts N) and the shared expert
-            cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
-            for (int s = 0; s < r.n; ++s) {
-                if (vexp_slots > 0) {
-                    const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
-                    int gty = 0, uty = 0, dty = 0;
-                    if (!g_vexp.get(m, l, r.experts[s], st, &eg, &gty, &eu, &uty, &ed, &dty, err)) {
-                        err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
+            // Compute routed expert s (streaming its quantised bytes from pinned RAM / the mmap) and accumulate
+            // w_s * expert(h) into `odff`.  Used on every GPU: the buffers + stream are parameters.
+            auto compute_expert = [&](int s, void* pg, void* pu, void* pd, const float* hsrc,
+                                      float* og, float* ou, float* ohh, float* odo, float* odff,
+                                      cudaStream_t ostr, const char* tag) -> bool {
+                int64_t gty, uty, dty; uint64_t gb, ub, db;
+                const uint8_t *gh = m.raw_slot_fast(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
+                              *uh = m.raw_slot_fast(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
+                              *dhb = m.raw_slot_fast(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
+                if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
+                if (cudaMemcpyAsync(pg, gh, (size_t) gb, cudaMemcpyHostToDevice, ostr) != cudaSuccess ||
+                    cudaMemcpyAsync(pu, uh, (size_t) ub, cudaMemcpyHostToDevice, ostr) != cudaSuccess ||
+                    cudaMemcpyAsync(pd, dhb, (size_t) db, cudaMemcpyHostToDevice, ostr) != cudaSuccess)
+                    return false;
+                K::iq_mmvq_f32((int) gty, pg, hsrc, og, NE, NFF, ostr);
+                K::iq_mmvq_f32((int) uty, pu, hsrc, ou, NE, NFF, ostr);
+                m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, ostr>>>(og, ou, ohh, NFF);
+                K::iq_mmvq_f32((int) dty, pd, ohh, odo, NFF, NE, ostr);
+                m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, ostr>>>(odff, odo, r.weights[s], NE);
+                const cudaError_t ee = cudaGetLastError();
+                if (ee != cudaSuccess) { err = std::string(tag) + ": " + cudaGetErrorString(ee); return false; }
+                return true;
+            };
+            if (g_mg.n_gpus > 1 && vexp_slots == 0) {
+                // ---- multi-GPU expert parallelism ----
+                // The routed experts are split across the GPUs by id % n_gpus.  Phase A enqueues every extra
+                // GPU's work WITHOUT waiting (their PCIe links then run concurrently); phase B computes GPU0's
+                // share while the extras' DMA/GEMVs are in flight; phase C waits and folds the partials.
+                cudaMemcpyAsync(g_mg.relay_h, dh, (size_t) NE * sizeof(float), cudaMemcpyDeviceToHost, st);
+                cudaStreamSynchronize(st);
+                // Phase A: enqueue the extra GPUs' work (async)
+                for (int i = 0; i < (int) g_mg.extra.size(); ++i) {
+                    const int dev = i + 1;
+                    cudaSetDevice(dev);
+                    const auto& E = g_mg.extra[i];
+                    cudaMemcpyAsync(E.h, g_mg.relay_h, (size_t) NE * sizeof(float), cudaMemcpyHostToDevice, E.st);
+                    cudaMemsetAsync(E.df, 0, (size_t) NE * sizeof(float), E.st);
+                    for (int s = 0; s < r.n; ++s) {
+                        if (g_mg.gpu_of(r.experts[s], g_mg.n_gpus) != dev) continue;
+                        if (!compute_expert(s, E.pool_g, E.pool_u, E.pool_d, E.h, E.dgate, E.dup, E.dhh, E.do_, E.df, E.st, "extra GPU expert")) {
+                            cudaSetDevice(0); return false;
+                        }
                     }
-                    K::iq_mmvq_f32(gty, eg, dh, dgate, NE, NFF, st); if (die("vexp gate")) return false;
-                    K::iq_mmvq_f32(uty, eu, dh, dup, NE, NFF, st); if (die("vexp up")) return false;
-                    m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                    K::iq_mmvq_f32(dty, ed, dhh, do_, NFF, NE, st); if (die("vexp down")) return false;
-                    m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
-                    if (die("vexp")) return false;
-                } else {
-                    int64_t gty, uty, dty; uint64_t gb, ub, db;
-                    const uint8_t *gh = m.raw_slot_fast(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
-                                  *uh = m.raw_slot_fast(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
-                                  *dhb = m.raw_slot_fast(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
-                    if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
-                    // one-shot streaming through a device pool (the no-LRU decode path); raw_slot_fast sources
-                    // the bytes from pinned RAM when the model is staged there (~2x the pageable-mmap H2D rate)
-                    static void* pool_g = nullptr; static void* pool_u = nullptr; static void* pool_d = nullptr;
-                    static size_t pool_sz = 0;
-                    const size_t need_gu = (size_t) NFF * 4096, need_d = (size_t) NE * 4096;
-                    if (pool_sz < need_gu + need_gu + need_d) {
-                        if (pool_g) { cudaFree(pool_g); cudaFree(pool_u); cudaFree(pool_d); }
-                        pool_sz = need_gu + need_gu + need_d;
-                        if (cudaMalloc(&pool_g, need_gu) != cudaSuccess || cudaMalloc(&pool_u, need_gu) != cudaSuccess ||
-                            cudaMalloc(&pool_d, need_d) != cudaSuccess) { err = "expert pool"; return false; }
+                    cudaMemcpyAsync(g_mg.relay_out + i * NE, E.df, (size_t) NE * sizeof(float), cudaMemcpyDeviceToHost, E.st);
+                }
+                // Phase B: GPU0's own share (experts with id % n_gpus == 0) while the extras work
+                cudaSetDevice(0);
+                cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
+                static void* pool_g = nullptr; static void* pool_u = nullptr; static void* pool_d = nullptr;
+                static size_t pool_sz = 0;
+                const size_t need_gu = (size_t) NFF * 4096, need_d = (size_t) NE * 4096;
+                if (pool_sz < need_gu + need_gu + need_d) {
+                    if (pool_g) { cudaFree(pool_g); cudaFree(pool_u); cudaFree(pool_d); }
+                    pool_sz = need_gu + need_gu + need_d;
+                    if (cudaMalloc(&pool_g, need_gu) != cudaSuccess || cudaMalloc(&pool_u, need_gu) != cudaSuccess ||
+                        cudaMalloc(&pool_d, need_d) != cudaSuccess) { err = "expert pool"; return false; }
+                }
+                for (int s = 0; s < r.n; ++s) {
+                    if (g_mg.gpu_of(r.experts[s], g_mg.n_gpus) != 0) continue;
+                    if (!compute_expert(s, pool_g, pool_u, pool_d, dh, dgate, dup, dhh, do_, df, st, "GPU0 expert")) return false;
+                }
+                // Phase C: wait for the extras, fold their partials into df
+                for (int i = 0; i < (int) g_mg.extra.size(); ++i) {
+                    cudaSetDevice(g_mg.extra[i].dev);
+                    if (cudaStreamSynchronize(g_mg.extra[i].st) != cudaSuccess) {
+                        err = "extra GPU wait: " + std::string(cudaGetErrorString(cudaGetLastError())); cudaSetDevice(0); return false;
                     }
-                    cudaMemcpyAsync(pool_g, gh, (size_t) gb, cudaMemcpyHostToDevice, st);
-                    cudaMemcpyAsync(pool_u, uh, (size_t) ub, cudaMemcpyHostToDevice, st);
-                    cudaMemcpyAsync(pool_d, dhb, (size_t) db, cudaMemcpyHostToDevice, st);
-                    K::iq_mmvq_f32((int) gty, pool_g, dh, dgate, NE, NFF, st); if (die("expert gate")) return false;
-                    K::iq_mmvq_f32((int) uty, pool_u, dh, dup, NE, NFF, st); if (die("expert up")) return false;
-                    m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                    K::iq_mmvq_f32((int) dty, pool_d, dhh, do_, NFF, NE, st); if (die("expert down")) return false;
-                    m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
-                    if (die("expert")) return false;
+                }
+                cudaSetDevice(0);
+                for (int i = 0; i < (int) g_mg.extra.size(); ++i) {
+                    if (cudaMemcpyAsync(ds.d_part, g_mg.relay_out + i * NE, (size_t) NE * sizeof(float), cudaMemcpyHostToDevice, st) != cudaSuccess)
+                        return die("partial H2D");
+                    m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, ds.d_part, NE);
+                }
+                if (die("multigpu experts")) return false;
+            } else {
+                // ---- single GPU: all routed experts here (VRAM LRU when --vexperts N) ----
+                cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
+                static void* pool_g = nullptr; static void* pool_u = nullptr; static void* pool_d = nullptr;
+                static size_t pool_sz = 0;
+                const size_t need_gu = (size_t) NFF * 4096, need_d = (size_t) NE * 4096;
+                if (pool_sz < need_gu + need_gu + need_d) {
+                    if (pool_g) { cudaFree(pool_g); cudaFree(pool_u); cudaFree(pool_d); }
+                    pool_sz = need_gu + need_gu + need_d;
+                    if (cudaMalloc(&pool_g, need_gu) != cudaSuccess || cudaMalloc(&pool_u, need_gu) != cudaSuccess ||
+                        cudaMalloc(&pool_d, need_d) != cudaSuccess) { err = "expert pool"; return false; }
+                }
+                for (int s = 0; s < r.n; ++s) {
+                    if (vexp_slots > 0) {
+                        const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
+                        int gty = 0, uty = 0, dty = 0;
+                        if (!g_vexp.get(m, l, r.experts[s], st, &eg, &gty, &eu, &uty, &ed, &dty, err)) {
+                            err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
+                        }
+                        K::iq_mmvq_f32(gty, eg, dh, dgate, NE, NFF, st); if (die("vexp gate")) return false;
+                        K::iq_mmvq_f32(uty, eu, dh, dup, NE, NFF, st); if (die("vexp up")) return false;
+                        m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+                        K::iq_mmvq_f32(dty, ed, dhh, do_, NFF, NE, st); if (die("vexp down")) return false;
+                        m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
+                        if (die("vexp")) return false;
+                    } else {
+                        if (!compute_expert(s, pool_g, pool_u, pool_d, dh, dgate, dup, dhh, do_, df, st, "expert")) return false;
+                    }
                 }
             }
             const double t_shared0 = tprof ? now_ms() : 0.0;
@@ -1406,7 +1534,7 @@ namespace minimax {
 int run(int argc, char** argv) {
     std::string model, tokens;
     int ctx = 8192, n_gen = 64;
-    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 0; int vexp_slots = 0; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
+    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 0; int vexp_slots = 0; int n_gpus = 3; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };
@@ -1420,6 +1548,7 @@ int run(int argc, char** argv) {
         else if (k == "--quant") use_quant = true;   // the quantised projection path (faster in principle; see the plan)
         else if (k == "--experts") { if (!next(v)) return 2; expert_cache = std::atoi(v.c_str()); }
         else if (k == "--vexperts") { if (!next(v)) return 2; vexp_slots = std::atoi(v.c_str()); }
+        else if (k == "--gpus") { if (!next(v)) return 2; n_gpus = std::atoi(v.c_str()); }
         else if (k == "--layers") { if (!next(v)) return 2; n_layers = std::atoi(v.c_str()); }
         else if (k == "--dump-logits") { if (!next(dump_logits)) return 2; }
         else if (k == "--dump-q") { if (!next(dump_q)) return 2; }
@@ -1541,7 +1670,7 @@ int run(int argc, char** argv) {
             // the decode engine: resident weights + a persistent KV cache, one step per token (no prefix
             // recomputation, no per-token weight re-upload)
             static M3DecodeState ds;
-            if (!ds.ready && !m3_decode_init(m, ds, true, ctx, err)) {
+            if (!ds.ready && !m3_decode_init(m, ds, true, ctx, n_gpus, err)) {
                 std::printf("ERR decode init (try a smaller --ctx): %s\n", err.c_str()); std::fflush(stdout); continue;
             }
             ds.n_pos = 0;   // a new conversation per GEN

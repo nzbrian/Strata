@@ -228,15 +228,38 @@ The speed bottleneck (measured): **1.4 s per token's expert FFN** - dequantise a
 the 4 routed experts (904 MB F32) on the fly, 57 sparse layers x 7 tokens. The
 projections are not the bottleneck.
 
+### The expert-cache mystery (where a fresh pair of eyes starts)
+The persistent F32 LRU (`Model::cached_expert` in `src/minimax/m3_engine.cu`, dormant — the
+expert loop dequants fresh per use) is the main speed lever, but it gives the **wrong token**.
+The exact symptom, measured:
+- The same expert `(layer=3, expert=49)` dequants to **−33858, 33858, …** when the target is
+  the cache slot (`expert_g_[slot]`), and to **0.0029, 0.0264, …** when the target is a fresh
+  `std::vector<float>`. Both use the same `raw_slot(3, 49, "ffn_gate_exps.weight")` source.
+- So the **source bytes appear to change between the two reads** — but the mmap is
+  `PROT_READ, MAP_PRIVATE` (read-only, `gguf_reader.hpp:461`), so it cannot be written.
+- Ruled out: the LRU slot management is correct (a double-assignment guard never fired; no
+  race — the copies are synchronous; no vector reallocation — all slots are allocated up front).
+- The fresh-per-use path (local vector, the current default) is exact and gives 200058.
+
+The leading hypotheses to check first:
+1. `raw_slot` / `tensor_data()` returning an **unstable pointer** for the same tensor between
+   calls (check `GgufModel::shard()` and `tensor_data` — does it re-resolve the offset each call,
+   and can that resolution differ?).
+2. An **aliasing** between the cache slot and the mmap that isn't obvious (the slot is a heap
+   `std::vector<float>`, the mmap is a file mapping — they should be disjoint, but verify the
+   slot's `data()` pointer is not within the mmap range).
+3. The dequant reading **out of bounds** (the `n` passed to `dequant_row` vs the actual quantised
+   byte count for that expert type) so it reads adjacent memory that changes.
+
+Reproduce with: `strata-m3 --model <shard> --layers 4 --tokens 20768,841,14997,894,275,26225,46 --experts 64`
+and the verify prints in `cached_expert` (re-add them; they were removed for the dormant state).
+
 ### Remaining for a realistic (fast + correct) run
-1. **The expert cache — implemented but dormant** (2026-07-21). The persistent F32 LRU
-   (dequant each expert once, reuse across tokens and forwards) is the right design and the
-   slot management is verified correct (no double-assignment, no race, no reallocation),
-   but dequantising into the cache slot **corrupts the file-mapped source**: the same expert
-   decodes to −33858 into the slot and 0.0029 into a fresh vector, so the mmap bytes change
-   between reads. The fresh-per-use path (local vector) is exact and is the default. Finding
-   the mmap write is the main lever — it should cut the expert FFN from ~1.4 s to the GEMM
-   time (~100 ms) per sparse layer per token.
+1. **The expert cache** — solve the mystery above, then enable it. It should cut the expert FFN
+   from ~1.4 s to the GEMM time (~100 ms) per sparse layer per token.
+2. A higher-precision activation for the quantised path (the Q8_1 activations are not
+   accurate enough for the token; F16 activations would be).
+3. Then: batch > 1, the serve-protocol end-to-end on the GPU path, and the product wiring.
 2. A higher-precision activation for the quantised path (the Q8_1 activations are not
    accurate enough for the token; F16 activations would be).
 3. Then: batch > 1, the serve-protocol end-to-end on the GPU path, and the product wiring.

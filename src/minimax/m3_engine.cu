@@ -414,17 +414,103 @@ bool forward(Model& m, const std::vector<int>& tokens, int n_layers, std::vector
 }
 
 
+// ---------------------------------------------------------------------------
+// VRAM expert LRU (quant path): the quantised bytes of hot experts live in a persistent GPU arena, so a token
+// whose routing hits a cached expert does no PCIe transfer at all.  A miss streams the expert's quantised bytes
+// from the model file (page cache) through a pinned staging buffer.  Copies and GEMVs share the caller's stream,
+// so stream ordering guarantees a recycled slot is never overwritten while a GEMV still reading it is in flight.
+// The arena outlives every forward (a file-scope instance), so the cache is warm across generated tokens.
+// ---------------------------------------------------------------------------
+struct VramExpertCache {
+    void* arena = nullptr;      // n_slots * slot_bytes of quantised expert bytes, [gate | up | down] per slot
+    void* staging = nullptr;    // pinned host staging of slot_bytes
+    size_t slot_bytes = 0;
+    size_t n_slots = 0;
+    struct Entry { int gty = 0, uty = 0, dty = 0; size_t gb = 0, ub = 0, db = 0; };
+    std::vector<Entry> info;
+    std::vector<size_t> free_slots;
+    std::list<uint64_t> lru;   // key = (layer<<32)|expert; MRU at the front
+    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_pos;
+    std::unordered_map<uint64_t, size_t> slot_of;
+    uint64_t hits = 0, misses = 0;
+
+    static uint64_t key(int layer, int expert) { return (uint64_t)(uint32_t) layer << 32 | (uint32_t) expert; }
+
+    bool init(size_t slots, size_t sbytes) {
+        if (arena) return true;   // already warm
+        n_slots = slots; slot_bytes = sbytes;
+        if (cudaMalloc(&arena, slots * sbytes) != cudaSuccess) { arena = nullptr; return false; }
+        if (cudaHostAlloc(&staging, sbytes, cudaHostAllocDefault) != cudaSuccess) {
+            cudaFree(arena); arena = nullptr; return false;
+        }
+        info.resize(slots);
+        for (size_t i = 0; i < slots; ++i) free_slots.push_back(i);
+        return true;
+    }
+
+    // The device pointers + ggml types of expert (layer, expert)'s quantised gate/up/down bytes.  A miss evicts
+    // the LRU victim (or takes a free slot) and streams the bytes in.
+    bool get(Model& m, int layer, int expert, cudaStream_t st,
+             const uint8_t** g, int* gty, const uint8_t** u, int* uty, const uint8_t** d, int* dty, std::string& err) {
+        const uint64_t k = key(layer, expert);
+        auto hit = lru_pos.find(k);
+        size_t slot;
+        if (hit != lru_pos.end()) {
+            lru.splice(lru.begin(), lru, hit->second);
+            slot = slot_of.at(k);
+            ++hits;
+        } else {
+            // the CPU memcpy below overwrites staging; make sure the previous miss's H2D has consumed it
+            if (cudaStreamSynchronize(st) != cudaSuccess) { err = "vexp staging sync"; return false; }
+            if (free_slots.empty()) {
+                const uint64_t old = lru.back(); lru.pop_back(); lru_pos.erase(old);
+                slot = slot_of[old]; slot_of.erase(old);   // the stale entry would let two keys share a slot
+            } else {
+                slot = free_slots.back(); free_slots.pop_back();
+            }
+            int64_t gt, ut, dt; uint64_t gb, ub, db;
+            const uint8_t *gh = m.raw_slot(layer, expert, "ffn_gate_exps.weight", gt, gb, err),
+                          *uh = m.raw_slot(layer, expert, "ffn_up_exps.weight", ut, ub, err),
+                          *dh = m.raw_slot(layer, expert, "ffn_down_exps.weight", dt, db, err);
+            if (!gh || !uh || !dh) return false;
+            if (gb + ub + db > slot_bytes) { err = "expert does not fit in the vexp slot"; return false; }
+            uint8_t* sp = (uint8_t*) staging;
+            std::memcpy(sp, gh, (size_t) gb);
+            std::memcpy(sp + gb, uh, (size_t) ub);
+            std::memcpy(sp + gb + ub, dh, (size_t) db);
+            uint8_t* dst = (uint8_t*) arena + slot * slot_bytes;
+            if (cudaMemcpyAsync(dst, staging, gb + ub + db, cudaMemcpyHostToDevice, st) != cudaSuccess) { err = "vexp H2D"; return false; }
+            info[slot] = { (int) gt, (int) ut, (int) dt, gb, ub, db };
+            lru.push_front(k); lru_pos[k] = lru.begin(); slot_of[k] = slot;
+            ++misses;
+        }
+        const Entry& e = info[slot];
+        const uint8_t* base = (const uint8_t*) arena + slot * slot_bytes;
+        *g = base;             *gty = e.gty;
+        *u = base + e.gb;      *uty = e.uty;
+        *d = base + e.gb + e.ub; *dty = e.dty;
+        return true;
+    }
+};
+static VramExpertCache g_vexp;
+
 /// The GPU forward: the same recipe as forward(), with the projections on the quantised GEMM (iq_mmvq on Q8_1
 /// activations) and the elementwise / attention work on the m3k kernels. Experts are streamed from the mmap (their
 /// quantised bytes) to the device one at a time - the 95.9 GiB expert stack does not fit in VRAM. Must produce the
 /// same token as the CPU forward.
-bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool use_quant, int expert_cache, std::vector<float>& logits, std::string& err) {
+bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool use_quant, int expert_cache,
+                 int vexp_slots, std::vector<float>& logits, std::string& err) {
     const int T = (int) tokens.size();
     const int nL = n_layers > 0 && n_layers < (int) m.geom.n_layers ? n_layers : (int) m.geom.n_layers;
     const int NE = m.dims.n_embd, H = m.dims.n_head, HKV = m.dims.n_head_kv, HD = m.dims.head_dim;
     const int NFF = (int) m.geom.n_ff;
     // the persistent F32 expert LRU (opt-in via --experts N); idempotent, so the warm cache survives across forwards
     if (expert_cache > 0) m.init_expert_cache((size_t) expert_cache, NE, NFF);
+    // the VRAM expert LRU (opt-in via --vexperts N on the quant path); 32 MB per slot covers this model's experts
+    // (~13 MB) with room for the file's widest type
+    if (use_quant && vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) {
+        err = "vexp arena allocation failed"; return false;
+    }
     cudaStream_t st;
     if (cudaStreamCreate(&st) != cudaSuccess) { err = "cudaStreamCreate"; return false; }
     strata::kernels::pdl_scope() = false;   // PDL needs a PDL predecessor; our custom kernels aren't one, so keep launches ordinary
@@ -686,7 +772,21 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                 // f = 0; accumulate the routed experts (streamed) and the shared expert
                 cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
                 for (int s = 0; s < r.n; ++s) {
-                    if (use_quant) {
+                    if (use_quant && vexp_slots > 0) {
+                        // VRAM LRU: on a hit the expert's quantised bytes are already on the GPU (no PCIe);
+                        // on a miss they are streamed in through the pinned staging buffer
+                        const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
+                        int gty = 0, uty = 0, dty = 0;
+                        if (!g_vexp.get(m, l, r.experts[s], st, &eg, &gty, &eu, &uty, &ed, &dty, err)) {
+                            err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
+                        }
+                        K::iq_mmvq_f32(gty, eg, dh, dgate, NE, NFF, st); if (die("vexp gate")) return false;
+                        K::iq_mmvq_f32(uty, eu, dh, dup, NE, NFF, st); if (die("vexp up")) return false;
+                        m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+                        K::iq_mmvq_f32(dty, ed, dhh, do_, NFF, NE, st); if (die("vexp down")) return false;
+                        m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
+                        if (die("vexp")) return false;
+                    } else if (use_quant) {
                         // stream the expert's raw quantised bytes to the pool (a few MB, ~15x less than the F32
                         // matrices) and run the quant-weight x float-activation GEMV on the GPU
                         int64_t gty, uty, dty; uint64_t gb, ub, db;
@@ -782,6 +882,336 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
     return true;
 }
 
+// ===========================================================================
+// Decode engine: resident projection weights + a persistent KV cache + single-token steps.
+//
+// The batched forward re-uploads ~7.5 GB of projection weights on every call and recomputes the whole prefix
+// for every generated token (the serve loop's 14.9 s/token). The decode engine uploads the weights once,
+// appends each new token's k/v to a persistent per-layer cache, and processes exactly one token per step -
+// which is what "tokens per second" actually measures. A prompt is just decode_step() called once per prompt
+// token in order; the KV cache grows as they are processed.
+// ===========================================================================
+struct M3DecodeState {
+    struct QW { void* d = nullptr; int64_t type = 0; size_t bytes = 0; };
+    struct Layer {
+        QW wq, wk, wv, wo, sg, su, sd, dg, du, dd;   // dg/du/dd only on dense layers
+        float *router = nullptr, *bias = nullptr;    // F32, sparse layers
+        float *idxq = nullptr, *idxk = nullptr;      // F32 indexer projections, sparse layers
+        float *an = nullptr, *qn = nullptr, *kn = nullptr, *fn = nullptr;
+        float *idxqn = nullptr, *idxkn = nullptr;
+    };
+    std::vector<Layer> layers;
+    void* detab = nullptr; int64_t etype = 0; size_t erow = 0;   // embedding table (quantised bytes, device)
+    QW head;
+    float* out_norm = nullptr;
+    float *dkv_k = nullptr, *dkv_v = nullptr;   // [nL][HKV][cap][HD] each
+    float* didxc = nullptr;                      // [n_sparse][cap][idx.dim]
+    int cap = 0, n_pos = 0;
+    int NE = 0, n_head = 0, HKV = 0, HD = 0, NFF = 0, nL = 0, dense_lead = 0, n_sparse = 0;
+    int idx_dim = 0, idx_groups = 0, idx_blk = 0, idx_topk = 0, idx_local = 0;
+    bool ready = false;
+};
+
+void m3_decode_free(M3DecodeState& ds) {
+    for (auto& L : ds.layers) {
+        for (auto* p : { &L.wq.d, &L.wk.d, &L.wv.d, &L.wo.d, &L.sg.d, &L.su.d, &L.sd.d, &L.dg.d, &L.du.d, &L.dd.d })
+            if (*p) { cudaFree(*p); *p = nullptr; }
+        for (auto* p : { &L.router, &L.bias, &L.idxq, &L.idxk, &L.an, &L.qn, &L.kn, &L.fn, &L.idxqn, &L.idxkn })
+            if (*p) { cudaFree(*p); *p = nullptr; }
+    }
+    ds.layers.clear();
+    if (ds.detab) { cudaFree(ds.detab); ds.detab = nullptr; }
+    if (ds.head.d) { cudaFree(ds.head.d); ds.head.d = nullptr; }
+    if (ds.out_norm) { cudaFree(ds.out_norm); ds.out_norm = nullptr; }
+    if (ds.dkv_k) { cudaFree(ds.dkv_k); ds.dkv_k = nullptr; }
+    if (ds.dkv_v) { cudaFree(ds.dkv_v); ds.dkv_v = nullptr; }
+    if (ds.didxc) { cudaFree(ds.didxc); ds.didxc = nullptr; }
+    ds.n_pos = 0; ds.ready = false;
+}
+
+bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, std::string& err) {
+    if (ds.ready) m3_decode_free(ds);
+    const int NE = m.dims.n_embd, H = m.dims.n_head, HKV = m.dims.n_head_kv, HD = m.dims.head_dim;
+    const int NFF = (int) m.geom.n_ff;
+    const int nL = (int) m.geom.n_layers;
+    ds.NE = NE; ds.n_head = H; ds.HKV = HKV; ds.HD = HD; ds.NFF = NFF; ds.nL = nL;
+    ds.dense_lead = (int) m.geom.n_dense_lead;
+    ds.n_sparse = nL - ds.dense_lead;
+    ds.cap = cap; ds.n_pos = 0;
+    ds.idx_dim = m.idx.dim; ds.idx_groups = m.idx.n_groups; ds.idx_blk = m.idx.blk;
+    ds.idx_topk = m.idx.topk; ds.idx_local = m.idx.local;
+
+    auto upload_quant = [&](const std::string& name, M3DecodeState::QW& w) -> bool {
+        int64_t ty; std::vector<uint64_t> sh;
+        const uint8_t* h = m.raw(name, ty, sh, err);
+        if (!h) return false;
+        const int64_t n = sh.size() >= 2 ? (int64_t) sh[0] * sh[1] : 0;
+        if (use_quant && (Q::Type) ty != Q::Type::F32) {
+            w.type = ty; w.bytes = Q::row_bytes((int) ty, n);
+            if (w.bytes == 0) { err = "no row bytes for " + name; return false; }
+            if (cudaMalloc(&w.d, w.bytes) != cudaSuccess) { err = "cudaMalloc " + name; return false; }
+            if (cudaMemcpy(w.d, h, w.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "H2D " + name; return false; }
+            return true;
+        }
+        std::vector<float> f((size_t) n);
+        if ((Q::Type) ty == Q::Type::F32) std::memcpy(f.data(), h, (size_t) n * sizeof(float));
+        else if (!Q::dequant_row((Q::Type) ty, h, f.data(), n)) { err = "dequant " + name; return false; }
+        w.type = (int64_t) Q::Type::F32; w.bytes = (size_t) n * sizeof(float);
+        if (cudaMalloc(&w.d, w.bytes) != cudaSuccess) { err = "cudaMalloc " + name; return false; }
+        cudaMemcpy(w.d, f.data(), w.bytes, cudaMemcpyHostToDevice);
+        return true;
+    };
+    auto upload_f32 = [&](const std::string& name, size_t n, float** p) -> bool {
+        int64_t ty; std::vector<uint64_t> sh;
+        const uint8_t* h = m.raw(name, ty, sh, err);
+        if (!h) return false;
+        std::vector<float> f(n);
+        if ((Q::Type) ty == Q::Type::F32) std::memcpy(f.data(), h, n * sizeof(float));
+        else if (!Q::dequant_row((Q::Type) ty, h, f.data(), (int64_t) n)) { err = "dequant " + name; return false; }
+        if (cudaMalloc(p, n * sizeof(float)) != cudaSuccess) { err = "cudaMalloc " + name; return false; }
+        cudaMemcpy(*p, f.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+        return true;
+    };
+
+    ds.layers.resize(nL);
+    for (int l = 0; l < nL; ++l) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        auto& L = ds.layers[l];
+        if (!upload_quant(p + "attn_q.weight", L.wq) || !upload_quant(p + "attn_k.weight", L.wk) ||
+            !upload_quant(p + "attn_v.weight", L.wv) || !upload_quant(p + "attn_output.weight", L.wo)) { err = "layer " + std::to_string(l) + " attn weights"; return false; }
+        if (!upload_f32(p + "attn_norm.weight", NE, &L.an) || !upload_f32(p + "attn_q_norm.weight", HD, &L.qn) ||
+            !upload_f32(p + "attn_k_norm.weight", HD, &L.kn) || !upload_f32(p + "ffn_norm.weight", NE, &L.fn)) {
+            err = "layer " + std::to_string(l) + " norms"; return false;
+        }
+        if (l < ds.dense_lead) {
+            if (!upload_quant(p + "ffn_gate.weight", L.dg) || !upload_quant(p + "ffn_up.weight", L.du) ||
+                !upload_quant(p + "ffn_down.weight", L.dd)) { err = "layer " + std::to_string(l) + " dense ffn"; return false; }
+        } else {
+            if (!upload_quant(p + "ffn_gate_shexp.weight", L.sg) || !upload_quant(p + "ffn_up_shexp.weight", L.su) ||
+                !upload_quant(p + "ffn_down_shexp.weight", L.sd)) { err = "layer " + std::to_string(l) + " shared expert"; return false; }
+            if (!upload_f32(p + "ffn_gate_inp.weight", (size_t) NE * m.geom.n_expert, &L.router) ||
+                !upload_f32(p + "exp_probs_b.bias", (size_t) m.geom.n_expert, &L.bias) ||
+                !upload_f32(p + "indexer.q_proj.weight", (size_t) NE * (m.idx.n_groups * m.idx.dim), &L.idxq) ||
+                !upload_f32(p + "indexer.k_proj.weight", (size_t) NE * m.idx.dim, &L.idxk) ||
+                !upload_f32(p + "indexer.q_norm.weight", (size_t) m.idx.dim, &L.idxqn) ||
+                !upload_f32(p + "indexer.k_norm.weight", (size_t) m.idx.dim, &L.idxkn)) {
+                err = "layer " + std::to_string(l) + " router/indexer"; return false;
+            }
+        }
+    }
+    {
+        int64_t ty; std::vector<uint64_t> sh;
+        const uint8_t* h = m.raw("token_embd.weight", ty, sh, err);
+        if (!h) { err = "token_embd.weight"; return false; }
+        ds.etype = ty; ds.erow = Q::row_bytes((int) ty, NE);
+        const size_t total = ds.erow * (size_t) m.geom.n_vocab;
+        if (cudaMalloc(&ds.detab, total) != cudaSuccess ||
+            cudaMemcpy(ds.detab, h, total, cudaMemcpyHostToDevice) != cudaSuccess) { err = "embedding table"; return false; }
+    }
+    if (!upload_quant("output.weight", ds.head)) { err = "output.weight"; return false; }
+    if (!upload_f32("output_norm.weight", NE, &ds.out_norm)) { err = "output_norm.weight"; return false; }
+    if (cudaMalloc(&ds.dkv_k, (size_t) nL * HKV * cap * HD * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&ds.dkv_v, (size_t) nL * HKV * cap * HD * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&ds.didxc, (size_t) ds.n_sparse * cap * m.idx.dim * sizeof(float)) != cudaSuccess) {
+        err = "KV cache allocation"; return false;
+    }
+    ds.ready = true;
+    return true;
+}
+
+// One decode step: process `token_id` at position ds.n_pos, attending to 0..P from the persistent cache,
+// appending its k/v, and returning the next-token logits. Advances ds.n_pos by one on success.
+bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
+                    std::vector<float>& logits, std::string& err) {
+    if (!ds.ready) { err = "decode state not initialised"; return false; }
+    const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD, NFF = ds.NFF;
+    const int P = ds.n_pos;
+    if (P >= ds.cap) { err = "context length exceeded (" + std::to_string(P) + ")"; return false; }
+    if (vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) { err = "vexp arena"; return false; }
+
+    cudaStream_t st;
+    if (cudaStreamCreate(&st) != cudaSuccess) { err = "cudaStreamCreate"; return false; }
+    auto die = [&](const char* w) -> bool { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; } return false; };
+
+    float *dx=nullptr,*dh=nullptr,*dq=nullptr,*dk=nullptr,*dv=nullptr,*da=nullptr,*do_=nullptr,
+          *dgate=nullptr,*dup=nullptr,*dhh=nullptr,*df=nullptr,*dout=nullptr,
+          *diq=nullptr,*dik=nullptr,*dq2=nullptr,*dk2=nullptr;
+    unsigned char* dmask=nullptr;
+    auto alloc = [&](float** p, size_t n) { return cudaMalloc(p, n * sizeof(float)) == cudaSuccess; };
+    if (!alloc(&dx, NE) || !alloc(&dh, NE) || !alloc(&dq, (size_t) H*HD) || !alloc(&dk, (size_t) HKV*HD) ||
+        !alloc(&dv, (size_t) HKV*HD) || !alloc(&da, (size_t) H*HD) || !alloc(&do_, NE) ||
+        !alloc(&dgate, NFF) || !alloc(&dup, NFF) || !alloc(&dhh, NFF) || !alloc(&df, NE) ||
+        !alloc(&dout, (size_t) m.geom.n_vocab) || !alloc(&diq, (size_t) m.idx.n_groups * m.idx.dim) ||
+        !alloc(&dik, m.idx.dim) || !alloc(&dq2, (size_t) H*HD) || !alloc(&dk2, (size_t) HKV*HD) ||
+        cudaMalloc(&dmask, (size_t) ds.cap) != cudaSuccess) { err = "decode scratch"; return false; }
+    int32_t* dtok = nullptr;
+    cudaMalloc(&dtok, sizeof(int32_t));
+    cudaMemcpyAsync(dtok, &token_id, sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    K::iq_embed_rows((int) ds.etype, ds.detab, ds.erow, dtok, 1, NE, dx, st); if (die("embed")) return false;
+
+    auto mmf = [&](const M3DecodeState::QW& w, const float* f32a, float* y, int n_in, int n_out) -> bool {
+        if (w.type == (int64_t) Q::Type::F32) {
+            m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
+            return !die("mmf");
+        }
+        K::iq_mmvq_f32((int) w.type, w.d, f32a, y, n_in, n_out, st);
+        return !die("mmf");
+    };
+
+    std::vector<float> scores((size_t) m.geom.n_expert), dh_host(NE), bias_host((size_t) m.geom.n_expert);
+    const bool dtrace = getenv("M3_TRACE") != nullptr;
+    char dts_buf[64];
+    auto dts = [&](const char* w, int l = -1) {
+        if (l < 0) std::snprintf(dts_buf, sizeof dts_buf, "[step] %s", w);
+        else std::snprintf(dts_buf, sizeof dts_buf, "[step] %s l=%d", w, l);
+        std::fprintf(stderr, "%s\n", dts_buf); std::fflush(stderr);
+    };
+    int sparse_idx = 0;
+    for (int l = 0; l < ds.nL; ++l) {
+        if (dtrace) dts("layer begin", l);
+        const auto& L = ds.layers[l];
+        const bool sparse = l >= ds.dense_lead;
+        float* xt = dx;
+        // ---- attention ----
+        m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.an, dh, NE, (float) m.geom.rms_eps);
+        if (die("rms1")) return false;
+        if (!mmf(L.wq, dh, dq, NE, H * HD)) return false;
+        if (!mmf(L.wk, dh, dk, NE, HKV * HD)) return false;
+        if (!mmf(L.wv, dh, dv, NE, HKV * HD)) return false;
+        m3k::k_rms<<<dim3(1, H), HD, 0, st>>>(dq, L.qn, dq2, HD, m.dims.eps);
+        m3k::k_rms<<<dim3(1, HKV), HD, 0, st>>>(dk, L.kn, dk2, HD, m.dims.eps);
+        m3k::k_rope<<<H + HKV, m.dims.n_rot / 2, 0, st>>>(dq2, dk2, H, HKV, HD, m.dims.n_rot, (float) P, m.dims.rope_base);
+        float* lkv_k = ds.dkv_k + (size_t) l * HKV * ds.cap * HD;
+        float* lkv_v = ds.dkv_v + (size_t) l * HKV * ds.cap * HD;
+        m3k::k_kv_append<<<HKV, HD, 0, st>>>(lkv_k, dk2, HKV, HD, ds.cap, P);
+        m3k::k_kv_append<<<HKV, HD, 0, st>>>(lkv_v, dv, HKV, HD, ds.cap, P);
+        if (sparse) {
+            // MSA indexer: score the key blocks, select top-k, attend to the union
+            m3k::k_f32_mm<<<(m.idx.n_groups * m.idx.dim + 127) / 128, 128, 0, st>>>(L.idxq, dh, diq, NE, m.idx.n_groups * m.idx.dim);
+            m3k::k_f32_mm<<<(m.idx.dim + 127) / 128, 128, 0, st>>>(L.idxk, dh, dik, NE, m.idx.dim);
+            m3k::k_rms<<<dim3(1, m.idx.n_groups), m.idx.dim, 0, st>>>(diq, L.idxqn, diq, m.idx.dim, m.dims.eps);
+            m3k::k_rms<<<dim3(1, 1), m.idx.dim, 0, st>>>(dik, L.idxkn, dik, m.idx.dim, m.dims.eps);
+            m3k::k_rope<<<m.idx.n_groups, m.dims.n_rot / 2, 0, st>>>(diq, nullptr, m.idx.n_groups, 0, m.idx.dim, m.dims.n_rot, (float) P, m.dims.rope_base);
+            m3k::k_rope<<<1, m.dims.n_rot / 2, 0, st>>>(dik, nullptr, 1, 0, m.idx.dim, m.dims.n_rot, (float) P, m.dims.rope_base);
+            if (die("indexer rope")) return false;
+            float* lidxc = ds.didxc + (size_t) sparse_idx * ds.cap * m.idx.dim;
+            cudaMemcpyAsync(lidxc + (size_t) P * m.idx.dim, dik, (size_t) m.idx.dim * sizeof(float), cudaMemcpyDeviceToDevice, st);
+            const int npos = P + 1, nblk = (npos + m.idx.blk - 1) / m.idx.blk;
+            std::vector<float> ikc((size_t) npos * m.idx.dim), diqh((size_t) m.idx.n_groups * m.idx.dim);
+            cudaMemcpyAsync(ikc.data(), lidxc, (size_t) npos * m.idx.dim * sizeof(float), cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(diqh.data(), diq, diqh.size() * sizeof(float), cudaMemcpyDeviceToHost, st);
+            cudaStreamSynchronize(st);
+            std::vector<unsigned char> mask(npos, 0);
+            std::vector<float> bscore((size_t) nblk);
+            for (int g = 0; g < m.idx.n_groups; ++g) {
+                mm::block_scores(diqh.data() + (size_t) g * m.idx.dim, ikc.data(), nullptr, npos, m.idx.dim, m.idx.blk, P, m.idx.local, bscore.data());
+                const mm::BlockSel sel = mm::select_blocks(bscore.data(), nblk, m.idx.topk);
+                for (int j = 0; j < sel.n; ++j)
+                    for (int pp = sel.blocks[j] * m.idx.blk; pp < (sel.blocks[j] + 1) * m.idx.blk && pp < npos; ++pp) mask[pp] = 1;
+            }
+            cudaMemcpyAsync(dmask, mask.data(), (size_t) npos, cudaMemcpyHostToDevice, st);
+            m3k::k_msa_attn<<<H, HD, 0, st>>>(dq2, lkv_k, lkv_v, dmask, da, H, HKV, HD, npos, ds.cap);
+            ++sparse_idx;
+        } else {
+            m3k::k_attn<<<H, HD, 0, st>>>(dq2, lkv_k, lkv_v, da, H, HKV, HD, P + 1, ds.cap, P);
+        }
+        if (die("attn")) return false;
+        if (!mmf(L.wo, da, do_, H * HD, NE)) return false;
+        m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, do_, NE);
+        if (die("add1")) return false;
+        // ---- FFN ----
+        if (!sparse) {
+            m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.fn, dh, NE, (float) m.geom.rms_eps);
+            if (!mmf(L.dg, dh, dgate, NE, NFF)) return false;
+            if (!mmf(L.du, dh, dup, NE, NFF)) return false;
+            m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+            if (!mmf(L.dd, dhh, df, NFF, NE)) return false;
+            m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
+            if (die("dense_ffn")) return false;
+        } else {
+            m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.fn, dh, NE, (float) m.geom.rms_eps);
+            // router on the GPU (resident F32 weights), scores back to the host for the top-k
+            float* dr = nullptr;
+            if (cudaMalloc(&dr, (size_t) m.geom.n_expert * sizeof(float)) != cudaSuccess) { err = "router scores"; return false; }
+            m3k::k_f32_mm<<<(m.geom.n_expert + 127) / 128, 128, 0, st>>>(L.router, dh, dr, NE, (int) m.geom.n_expert);
+            cudaMemcpyAsync(scores.data(), dr, (size_t) m.geom.n_expert * sizeof(float), cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(bias_host.data(), L.bias, (size_t) m.geom.n_expert * sizeof(float), cudaMemcpyDeviceToHost, st);
+            cudaStreamSynchronize(st);
+            cudaFree(dr);
+            if (die("router")) return false;
+            mm::MoEWeights mw;
+            mw.n_expert = (int) m.geom.n_expert; mw.n_expert_used = (int) m.geom.n_expert_used;
+            mw.n_ff = NFF; mw.n_embd = NE; mw.scale = 2.0f; mw.norm = true;
+            const mm::Route r = mm::route(scores.data(), bias_host.data(), mw.n_expert, mw.n_expert_used, true, 2.0f);
+            // f = 0; accumulate the routed experts (VRAM LRU when --vexperts N) and the shared expert
+            cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
+            for (int s = 0; s < r.n; ++s) {
+                if (vexp_slots > 0) {
+                    const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
+                    int gty = 0, uty = 0, dty = 0;
+                    if (!g_vexp.get(m, l, r.experts[s], st, &eg, &gty, &eu, &uty, &ed, &dty, err)) {
+                        err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
+                    }
+                    K::iq_mmvq_f32(gty, eg, dh, dgate, NE, NFF, st); if (die("vexp gate")) return false;
+                    K::iq_mmvq_f32(uty, eu, dh, dup, NE, NFF, st); if (die("vexp up")) return false;
+                    m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+                    K::iq_mmvq_f32(dty, ed, dhh, do_, NFF, NE, st); if (die("vexp down")) return false;
+                    m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
+                    if (die("vexp")) return false;
+                } else {
+                    int64_t gty, uty, dty; uint64_t gb, ub, db;
+                    const uint8_t *gh = m.raw_slot(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
+                                  *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
+                                  *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
+                    if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
+                    // one-shot streaming through a device pool (the no-LRU decode path)
+                    static void* pool_g = nullptr; static void* pool_u = nullptr; static void* pool_d = nullptr;
+                    static size_t pool_sz = 0;
+                    const size_t need_gu = (size_t) NFF * 4096, need_d = (size_t) NE * 4096;
+                    if (pool_sz < need_gu + need_gu + need_d) {
+                        if (pool_g) { cudaFree(pool_g); cudaFree(pool_u); cudaFree(pool_d); }
+                        pool_sz = need_gu + need_gu + need_d;
+                        if (cudaMalloc(&pool_g, need_gu) != cudaSuccess || cudaMalloc(&pool_u, need_gu) != cudaSuccess ||
+                            cudaMalloc(&pool_d, need_d) != cudaSuccess) { err = "expert pool"; return false; }
+                    }
+                    cudaMemcpyAsync(pool_g, gh, (size_t) gb, cudaMemcpyHostToDevice, st);
+                    cudaMemcpyAsync(pool_u, uh, (size_t) ub, cudaMemcpyHostToDevice, st);
+                    cudaMemcpyAsync(pool_d, dhb, (size_t) db, cudaMemcpyHostToDevice, st);
+                    K::iq_mmvq_f32((int) gty, pool_g, dh, dgate, NE, NFF, st); if (die("expert gate")) return false;
+                    K::iq_mmvq_f32((int) uty, pool_u, dh, dup, NE, NFF, st); if (die("expert up")) return false;
+                    m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+                    K::iq_mmvq_f32((int) dty, pool_d, dhh, do_, NFF, NE, st); if (die("expert down")) return false;
+                    m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
+                    if (die("expert")) return false;
+                }
+            }
+            // shared expert (weight 1)
+            if (!mmf(L.sg, dh, dgate, NE, NFF)) return false;
+            if (!mmf(L.su, dh, dup, NE, NFF)) return false;
+            m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
+            if (!mmf(L.sd, dhh, do_, NFF, NE)) return false;
+            m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, 1.0f, NE);
+            m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
+            if (die("moe_ffn")) return false;
+        }
+        if (dtrace) dts("layer end", l);
+    }
+    ds.n_pos = P + 1;
+    // ---- final norm + head ----
+    m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(dx, ds.out_norm, dh, NE, (float) m.geom.rms_eps);
+    if (!mmf(ds.head, dh, dout, NE, (int) m.geom.n_vocab)) { err = "head"; return false; }
+    logits.assign((size_t) m.geom.n_vocab, 0.0f);
+    cudaMemcpyAsync(logits.data(), dout, (size_t) m.geom.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (die("head copy")) return false;
+    // free step scratch
+    cudaFree(dx); cudaFree(dh); cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(da); cudaFree(do_);
+    cudaFree(dgate); cudaFree(dup); cudaFree(dhh); cudaFree(df); cudaFree(dout);
+    cudaFree(diq); cudaFree(dik); cudaFree(dq2); cudaFree(dk2); cudaFree(dmask); cudaFree(dtok);
+    cudaStreamDestroy(st);
+    return true;
+}
+
 }  // namespace
 
 namespace strata {
@@ -790,7 +1220,7 @@ namespace minimax {
 int run(int argc, char** argv) {
     std::string model, tokens;
     int ctx = 8192, n_gen = 64;
-    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 0; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
+    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 0; int vexp_slots = 0; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };
@@ -803,6 +1233,7 @@ int run(int argc, char** argv) {
         else if (k == "--cpu") use_gpu = false;
         else if (k == "--quant") use_quant = true;   // the quantised projection path (faster in principle; see the plan)
         else if (k == "--experts") { if (!next(v)) return 2; expert_cache = std::atoi(v.c_str()); }
+        else if (k == "--vexperts") { if (!next(v)) return 2; vexp_slots = std::atoi(v.c_str()); }
         else if (k == "--layers") { if (!next(v)) return 2; n_layers = std::atoi(v.c_str()); }
         else if (k == "--dump-logits") { if (!next(dump_logits)) return 2; }
         else if (k == "--dump-q") { if (!next(dump_q)) return 2; }
@@ -848,7 +1279,13 @@ int run(int argc, char** argv) {
         g_dump_qr = dump_qr.empty() ? nullptr : dump_qr.c_str();
         g_dump_da = dump_da.empty() ? nullptr : dump_da.c_str();
         g_dump_kr = dump_kr.empty() ? nullptr : dump_kr.c_str();
-        if (!(use_gpu ? forward_gpu(m, ids, n_layers, use_quant, expert_cache, logits, err) : forward(m, ids, n_layers, logits, err))) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!(use_gpu ? forward_gpu(m, ids, n_layers, use_quant, expert_cache, vexp_slots, logits, err) : forward(m, ids, n_layers, logits, err))) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (use_quant && vexp_slots > 0) {
+            const uint64_t total = g_vexp.hits + g_vexp.misses;
+            std::fprintf(stderr, "vexp cache    %zu slots, %llu/%llu uses hit (%.1f%%)\n", g_vexp.n_slots,
+                         (unsigned long long) g_vexp.hits, (unsigned long long) total,
+                         total ? 100.0 * (double) g_vexp.hits / (double) total : 0.0);
+        }
         if (!dump_logits.empty()) { std::FILE* dl = std::fopen(dump_logits.c_str(), "w"); if (dl) { for (size_t i = 0; i < logits.size(); ++i) std::fprintf(dl, "%.6f\n", logits[i]); std::fclose(dl); } }
         if (!dump_q.empty() && !g_dump_q_data.empty()) { std::FILE* dqf = std::fopen(dump_q.c_str(), "w"); if (dqf) { for (size_t i = 0; i < g_dump_q_data.size(); ++i) std::fprintf(dqf, "%.6f\n", g_dump_q_data[i]); std::fclose(dqf); } }
         if (!dump_qr.empty() && !g_dump_qr_data.empty()) { std::FILE* drf = std::fopen(dump_qr.c_str(), "w"); if (drf) { for (size_t i = 0; i < g_dump_qr_data.size(); ++i) std::fprintf(drf, "%.6f\n", g_dump_qr_data[i]); std::fclose(drf); } }
@@ -914,15 +1351,51 @@ int run(int argc, char** argv) {
         }
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<int> produced;
-        for (int g = 0; g < max_new; ++g) {
+        if (use_gpu && use_quant) {
+            // the decode engine: resident weights + a persistent KV cache, one step per token (no prefix
+            // recomputation, no per-token weight re-upload)
+            static M3DecodeState ds;
+            if (!ds.ready && !m3_decode_init(m, ds, true, ctx, err)) {
+                std::printf("ERR decode init (try a smaller --ctx): %s\n", err.c_str()); std::fflush(stdout); continue;
+            }
+            ds.n_pos = 0;   // a new conversation per GEN
+            const bool trace = getenv("M3_TRACE") != nullptr;
+            static int trace_seq = 0;
+            auto tstamp = [&]() {
+                const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count() % 1000000000L;
+                std::fprintf(stderr, "[trace seq=%d pos=%d t=%ld]\n", trace_seq, ds.n_pos, ms); std::fflush(stderr);
+            };
             std::vector<float> logits;
-            if (!(use_gpu ? forward_gpu(m, ids, 0, use_quant, expert_cache, logits, err) : forward(m, ids, 0, logits, err))) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
-            int best = 0;
-            for (size_t i = 1; i < logits.size(); ++i) if (logits[i] > logits[best]) best = (int) i;
-            produced.push_back(best);
-            std::printf("T %d\n", best);
-            std::fflush(stdout);
-            ids.push_back(best);
+            bool ok = true;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (trace) { tstamp(); ++trace_seq; }
+                if (!m3_decode_step(m, ds, vexp_slots, ids[i], logits, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); ok = false; break; }
+            }
+            if (ok) {
+                for (int g = 0; g < max_new; ++g) {
+                    int best = 0;
+                    for (size_t i = 1; i < logits.size(); ++i) if (logits[i] > logits[best]) best = (int) i;
+                    produced.push_back(best);
+                    std::printf("T %d\n", best);
+                    std::fflush(stdout);
+                    if (g + 1 < max_new) {
+                        if (trace) { tstamp(); ++trace_seq; }
+                        if (!m3_decode_step(m, ds, vexp_slots, best, logits, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
+                    }
+                }
+            }
+        } else {
+            for (int g = 0; g < max_new; ++g) {
+                std::vector<float> logits;
+                if (!(use_gpu ? forward_gpu(m, ids, 0, use_quant, expert_cache, vexp_slots, logits, err) : forward(m, ids, 0, logits, err))) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
+                int best = 0;
+                for (size_t i = 1; i < logits.size(); ++i) if (logits[i] > logits[best]) best = (int) i;
+                produced.push_back(best);
+                std::printf("T %d\n", best);
+                std::fflush(stdout);
+                ids.push_back(best);
+            }
         }
         std::printf("DONE %d %zu %.1f 0.0 %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", (long long) produced.size(), ids.size(),
                     secs(t0), produced.empty() ? "" : "stop", ids.size(), (long long) 0);

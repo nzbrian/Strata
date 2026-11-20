@@ -1,33 +1,64 @@
-# MiniMax-M3 speed: 0.002 → ~10 tok/s on 3× 5060 Ti + 1× 3060, 256 GB RAM
+# MiniMax-M3 speed: status and the honest ceiling
 
-Target ~10 tok/s decode. 20 tok/s is out of reach (model 112 GB > 44 GB VRAM; routed
-experts not in VRAM must cross PCIe Gen3 x8/x8/x16 ≈ 32 GB/s aggregate → ~10 tok/s ceiling).
+Hardware: 2× RTX 5060 Ti (16 GB, PCIe Gen3 **x8** ≈ 6 GB/s usable each) + 1× RTX 3060 (12 GB,
+Gen3 **x16** ≈ 12 GB/s usable), 256 GB RAM. Model: 112 GB AD-IQ2_XXS (≈90% MoE experts:
+57 sparse layers × 128 experts, top-4 + 1 shared; 3 leading dense layers).
 
-## Hardware
-- GPU0/1: RTX 5060 Ti, 16 GB, PCIe Gen3 x8 (≈8 GB/s each)
-- GPU2: RTX 3060, 12 GB, PCIe Gen3 x16 (≈16 GB/s)
-- 256 GB RAM. Model 112.2 GB (≈90% MoE experts, 128/layer top-4 + 1 shared, 57 sparse layers).
-- Per-token weight reads (quantised): ~5 GB routed experts + ~1.5 GB attention + ~0.8 GB embed/head.
+## Where we are (measured on one 5060 Ti)
 
-## Ceiling math
-Attention+embed+KV in VRAM (~4 GB). ~39 GB VRAM left for a hot-expert LRU (~39% of experts).
-Routed experts not in VRAM ≈ 0.61 × 5 GB ≈ 3.0 GB/token over 32 GB/s ≈ 95 ms → ~10.5 tok/s.
+| Path | Result |
+|---|---|
+| All-F32 (original) | 492 s per 7-token forward, correct token 200058 |
+| `--quant` batched forward (quant-weight × float-activation GEMV) | **15.8 s** per 7-token forward, **correct 200058** (31× faster) |
+| **Decode engine** (resident weights + persistent KV + 1-token steps) | **~2.06 s/token ≈ 0.49 tok/s**, correct token sequence |
 
-## Phases (measure each)
-- **P0 baseline** (done): all-F32 single GPU = 492 s/token (0.002 tok/s). `--quant` (Q8_1 act)
-  baseline: <pending>.
-- **P1 correct+fast single-GPU quantised path** (~1.5–2 tok/s):
-  1. Quantised-weight × **BF16-activation** GEMV (iq_mmvq is Q8_1-only; Q8_1 act compounds to a
-     wrong token over 60 layers). [kernel]
-  2. Weights resident: attention+embed in VRAM, experts in **pinned** RAM; async double-buffered
-     H2D (no per-token re-upload from the mmap). [engine]
-  3. Verify: 4-layer logits match the all-F32 reference; full model → 200058. Measure.
-- **P2 3-GPU** (~10 tok/s):
-  4. Layer split across 3 GPUs; each streams its experts over its own link.
-  5. Expert VRAM LRU (per-GPU) for the hot experts.
-  6. Verify 200058; measure toward 10 tok/s.
+The `--quant` path and the decode engine both reproduce the reference token 200058 and match the
+batched forward's logits. This is a working, correct, measured M3 CUDA decode path.
+
+## The honest ceiling (corrects the earlier "~10 tok/s")
+
+Per decode token the model must read **~3 GB of routed-expert weights** (228 expert uses × ~13 MB
+quantised bytes) that do not fit in VRAM (experts total ~100 GB; 44 GB VRAM across all GPUs).
+
+- **Layers are strictly sequential**, so only ONE GPU's PCIe link streams experts at a time. The
+  3 GPUs give 3× *VRAM* (a bigger expert cache), NOT 3× *bandwidth*.
+- Single GPU: ~3 GB/token over ~6 GB/s ≈ 0.5 s/token of pure streaming + GEMV compute →
+  **~0.5–1 tok/s** is the single-GPU ceiling (we measure 0.49).
+- All 3 GPUs (weights + KV + expert LRU spread across 44 GB): a thrash-free expert LRU caches a
+  large fraction of the ~3 GB/token, cutting PCIe traffic → **~2–4 tok/s** is the realistic
+  ceiling.
+- **10 tok/s is not physically reachable** on this box for this model. It would need ~30 GB/s of
+  effective expert-weight bandwidth, which the single-active-PCIe-link + VRAM-capacity limits do
+  not provide. (My earlier "10 tok/s ceiling" estimate wrongly assumed 32 GB/s aggregate PCIe.)
+
+## The single-GPU VRAM wall (why vexp didn't help on one GPU)
+
+Resident projection weights ≈ 9.1 GB. A useful expert LRU needs ≥ ~8 GB (a token's working set is
+228 distinct (layer,expert) instances; a 128-slot LRU evicts itself mid-token and thrashes —
+measured SLOWER than no cache). 9.1 + 8 + KV > 16 GB, so on one 5060 Ti you must choose between
+resident weights and a useful expert cache. Multi-GPU is the only way to have both.
+
+## Done
+- [x] P0: all-F32 correct baseline (492 s).
+- [x] P1: quant-weight × float-activation GEMV kernel (`iq_mmvq_f32`), all 7 model types, oracle-
+      verified against CPU dequant to <2e-6; correct 200058 at 15.8 s (31×).
+- [x] P1: VRAM expert LRU (`--vexperts N`, pinned-staging misses) — correct, but thrashes below
+      the per-token working set; useful only with the multi-GPU VRAM headroom.
+- [x] P1: decode engine (resident weights + persistent KV + single-token steps) — correct,
+      measured 0.49 tok/s single-GPU.
+
+## Remaining (only if the user wants the multi-GPU push)
+- [ ] **S2: 3-GPU layer split.** Split the 60 layers across the 3 GPUs (each holds its layers'
+      resident weights + its own expert LRU + KV). Sequential layer dependency means one GPU is
+      active at a time, but the aggregate 44 GB VRAM holds a thrash-free expert LRU → the 2–4
+      tok/s ceiling. This is a multi-hour rearchitecture (multi-device CUDA context, per-GPU
+      placement, cross-GPU residual handoff).
+- [ ] F16 activations / a faster expert GEMV to cut the compute half of the ~2 s/token.
+- [ ] Fix the pre-existing `free(): double free` at process exit after a serve run (cosmetic;
+      does not affect the generated output).
 
 ## Notes
-- Correctness oracle: all-F32 path gives top-1 200058 (the reference). 4-layer logit diff is the
-  fast check; full run is the milestone check.
-- Keep the all-F32 path intact (default) as the correctness reference.
+- Correctness oracle: the all-F32 path and the batched `--quant` forward both give top-1 200058
+  for the Moon prompt; the decode engine matches.
+- The pre-existing `free(): double free detected in tcache` fires at process exit after any serve
+  run (present before the decode engine); all tokens are produced before it.

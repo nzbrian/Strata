@@ -161,14 +161,18 @@ class Model {
     }
     /// One expert's dequantised F32 matrices, from the persistent LRU cache (dequantised once, reused across
     /// tokens and across forwards, so a warm cache streams over PCIe instead of re-dequantising on the CPU).
-    bool cached_expert(int layer, int expert, int n_embd, int n_ff, std::vector<float>& gate, std::vector<float>& up,
-                       std::vector<float>& down, std::string& err) {
+    /// One expert's dequantised F32 matrices, from the persistent LRU cache (dequantised once, reused across
+    /// tokens and forwards, so a warm cache streams over PCIe instead of re-dequantising on the CPU).
+    /// `gate`/`up`/`down` are set to point at the cache slot (no copy); the pointers stay valid until the slot is
+    /// evicted, so the caller must finish any async copy out of them before the next call that may evict.
+    bool cached_expert(int layer, int expert, int n_embd, int n_ff, const std::vector<float>** gate,
+                       const std::vector<float>** up, const std::vector<float>** down, std::string& err) {
         const uint64_t key = ((uint64_t) (uint32_t) layer << 32) | (uint64_t) (uint32_t) expert;
         auto hit = lru_pos_.find(key);
         if (hit != lru_pos_.end()) {
             lru_.splice(lru_.begin(), lru_, hit->second);
             const size_t s = slot_of_.at(key);
-            gate = expert_g_[s]; up = expert_u_[s]; down = expert_d_[s];
+            *gate = &expert_g_[s]; *up = &expert_u_[s]; *down = &expert_d_[s];
             return true;
         }
         // a miss: get a slot (evict the least-recently-used one if the pool is full)
@@ -184,21 +188,27 @@ class Model {
             free_slots_.pop_back();
         }
         const size_t gu = (size_t) n_embd * n_ff, dd = (size_t) n_ff * n_embd;
-        int64_t ty; uint64_t by;
-        const uint8_t *gh = raw_slot(layer, expert, "ffn_gate_exps.weight", ty, by, err),
-                      *uh = raw_slot(layer, expert, "ffn_up_exps.weight", ty, by, err),
-                      *dh = raw_slot(layer, expert, "ffn_down_exps.weight", ty, by, err);
+        // each matrix keeps its OWN ggml type (in this model gate/up are IQ1_M, down is IQ2_XXS): dequantising one
+        // with another's type reads the blocks wrong and yields garbage - the old shared-`ty` did exactly that.
+        int64_t gty, uty, dty; uint64_t gb, ub, db;
+        const uint8_t *gh = raw_slot(layer, expert, "ffn_gate_exps.weight", gty, gb, err),
+                      *uh = raw_slot(layer, expert, "ffn_up_exps.weight", uty, ub, err),
+                      *dh = raw_slot(layer, expert, "ffn_down_exps.weight", dty, db, err);
         if (!gh || !uh || !dh) { err = "expert " + std::to_string(expert) + ": " + err; return false; }
-        if (!Q::dequant_row((Q::Type) ty, gh, expert_g_[slot].data(), (int64_t) gu) ||
-            !Q::dequant_row((Q::Type) ty, uh, expert_u_[slot].data(), (int64_t) gu) ||
-            !Q::dequant_row((Q::Type) ty, dh, expert_d_[slot].data(), (int64_t) dd)) { err = "expert dequant"; return false; }
+        if (!Q::dequant_row((Q::Type) gty, gh, expert_g_[slot].data(), (int64_t) gu) ||
+            !Q::dequant_row((Q::Type) uty, uh, expert_u_[slot].data(), (int64_t) gu) ||
+            !Q::dequant_row((Q::Type) dty, dh, expert_d_[slot].data(), (int64_t) dd)) { err = "expert dequant"; return false; }
         lru_.push_front(key); lru_pos_[key] = lru_.begin(); slot_of_[key] = slot;
-        gate = expert_g_[slot]; up = expert_u_[slot]; down = expert_d_[slot];
+        *gate = &expert_g_[slot]; *up = &expert_u_[slot]; *down = &expert_d_[slot];
         return true;
     }
     size_t expert_cache_size() const { return expert_slots_; }
-    /// Size the expert cache: expert_slots_ of (gate, up, down) F32 buffers in CPU RAM.
+    /// Size the expert cache: expert_slots_ of (gate, up, down) F32 buffers in CPU RAM.  Idempotent: a second call
+    /// with the same size keeps the warm cache (the Model outlives every forward).
     void init_expert_cache(size_t slots, int n_embd, int n_ff) {
+        if (expert_slots_ == slots && expert_g_.size() == slots) return;
+        expert_g_.clear(); expert_u_.clear(); expert_d_.clear();
+        lru_.clear(); lru_pos_.clear(); slot_of_.clear();
         expert_slots_ = slots;
         free_slots_.clear();
         for (size_t i = 0; i < slots; ++i) {
@@ -413,6 +423,8 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
     const int nL = n_layers > 0 && n_layers < (int) m.geom.n_layers ? n_layers : (int) m.geom.n_layers;
     const int NE = m.dims.n_embd, H = m.dims.n_head, HKV = m.dims.n_head_kv, HD = m.dims.head_dim;
     const int NFF = (int) m.geom.n_ff;
+    // the persistent F32 expert LRU (opt-in via --experts N); idempotent, so the warm cache survives across forwards
+    if (expert_cache > 0) m.init_expert_cache((size_t) expert_cache, NE, NFF);
     cudaStream_t st;
     if (cudaStreamCreate(&st) != cudaSuccess) { err = "cudaStreamCreate"; return false; }
     strata::kernels::pdl_scope() = false;   // PDL needs a PDL predecessor; our custom kernels aren't one, so keep launches ordinary
@@ -424,6 +436,9 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
 
     // device scratch, sized for the largest row (the expert intermediates are the biggest: n_ff)
     std::vector<float> router_host;
+    // fresh-per-use F32 expert buffers (only when the LRU cache is off); reused across experts so the pointers
+    // handed to cudaMemcpyAsync stay valid for the copy
+    std::vector<float> fresh_g_, fresh_u_, fresh_d_;
     float *dx = nullptr, *dh = nullptr, *dq = nullptr, *dk = nullptr, *dv = nullptr, *da = nullptr, *do_ = nullptr,
           *dgate = nullptr, *dup = nullptr, *dhh = nullptr, *df = nullptr, *dr = nullptr, *dout = nullptr, *dkv_k = nullptr, *dkv_v = nullptr,
           *diq = nullptr, *dik = nullptr, *dikc = nullptr, *dq2 = nullptr, *dk2 = nullptr;
@@ -666,21 +681,30 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                 // f = 0; accumulate the routed experts (streamed) and the shared expert
                 cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
                 for (int s = 0; s < r.n; ++s) {
-                    // dequant the expert's three matrices to F32 (fresh per use; the LRU cache is dormant - it
-                    // corrupts the mmap source, see the plan) and stream them to the pool
-                    int64_t gty, uty, dty; uint64_t gb, ub, db;
-                    const uint8_t *gh = m.raw_slot(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
-                                  *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
-                                  *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
-                    if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
-                    const uint64_t per = (uint64_t) NE * NFF;
-                    std::vector<float> gslot(per), uslot(per), dslot((uint64_t) NFF * NE);
-                    if (!Q::dequant_row((Q::Type) gty, gh, gslot.data(), (int64_t) per) ||
-                        !Q::dequant_row((Q::Type) uty, uh, uslot.data(), (int64_t) per) ||
-                        !Q::dequant_row((Q::Type) dty, dhb, dslot.data(), (int64_t) (NFF * NE))) { err = "expert dequant"; return false; }
-                    cudaMemcpyAsync(exp_g, gslot.data(), gslot.size() * sizeof(float), cudaMemcpyHostToDevice, st);
-                    cudaMemcpyAsync(exp_u, uslot.data(), uslot.size() * sizeof(float), cudaMemcpyHostToDevice, st);
-                    cudaMemcpyAsync(exp_d, dslot.data(), dslot.size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                    // the expert's three matrices to F32, streamed to the pool.  With --experts N this is the
+                    // persistent LRU (dequantised once, then the cached slot is re-streamed over PCIe); without it,
+                    // a fresh dequant per use.  Sync first so a prior async copy out of a slot is done before this
+                    // call may evict and overwrite it.
+                    if (cudaStreamSynchronize(st) != cudaSuccess) { err = "expert cache sync"; return false; }
+                    const std::vector<float> *gslot, *uslot, *dslot;
+                    if (expert_cache > 0) {
+                        if (!m.cached_expert(l, r.experts[s], NE, NFF, &gslot, &uslot, &dslot, err)) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
+                    } else {
+                        int64_t gty, uty, dty; uint64_t gb, ub, db;
+                        const uint8_t *gh = m.raw_slot(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
+                                      *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
+                                      *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
+                        if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
+                        const uint64_t per = (uint64_t) NE * NFF;
+                        fresh_g_.resize(per); fresh_u_.resize(per); fresh_d_.resize((uint64_t) NFF * NE);   // dequant overwrites all
+                        if (!Q::dequant_row((Q::Type) gty, gh, fresh_g_.data(), (int64_t) per) ||
+                            !Q::dequant_row((Q::Type) uty, uh, fresh_u_.data(), (int64_t) per) ||
+                            !Q::dequant_row((Q::Type) dty, dhb, fresh_d_.data(), (int64_t) (NFF * NE))) { err = "expert dequant"; return false; }
+                        gslot = &fresh_g_; uslot = &fresh_u_; dslot = &fresh_d_;
+                    }
+                    cudaMemcpyAsync(exp_g, gslot->data(), gslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                    cudaMemcpyAsync(exp_u, uslot->data(), uslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
+                    cudaMemcpyAsync(exp_d, dslot->data(), dslot->size() * sizeof(float), cudaMemcpyHostToDevice, st);
                     m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_g, dh, dgate, NE, NFF); if (die("expert gate")) return false;
                     m3k::k_f32_mm<<<(NFF + 127) / 128, 128, 0, st>>>((const float*) exp_u, dh, dup, NE, NFF); if (die("expert up")) return false;
                     m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
@@ -743,7 +767,7 @@ namespace minimax {
 int run(int argc, char** argv) {
     std::string model, tokens;
     int ctx = 8192, n_gen = 64;
-    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 850; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
+    bool serve = false, use_gpu = true, use_quant = false; int n_layers = 0; int expert_cache = 0; std::string dump_logits, dump_q, dump_x, dump_xa, dump_dv, dump_dq, dump_qn, dump_qr, dump_da, dump_kr;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](std::string& d) { return i + 1 < argc ? (d = argv[++i], true) : false; };

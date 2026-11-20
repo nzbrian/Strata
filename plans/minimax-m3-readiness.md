@@ -228,45 +228,43 @@ The speed bottleneck (measured): **1.4 s per token's expert FFN** - dequantise a
 the 4 routed experts (904 MB F32) on the fly, 57 sparse layers x 7 tokens. The
 projections are not the bottleneck.
 
-### The expert-cache mystery (where a fresh pair of eyes starts)
-The persistent F32 LRU (`Model::cached_expert` in `src/minimax/m3_engine.cu`, dormant — the
-expert loop dequants fresh per use) is the main speed lever, but it gives the **wrong token**.
-The exact symptom, measured:
-- The same expert `(layer=3, expert=49)` dequants to **−33858, 33858, …** when the target is
-  the cache slot (`expert_g_[slot]`), and to **0.0029, 0.0264, …** when the target is a fresh
-  `std::vector<float>`. Both use the same `raw_slot(3, 49, "ffn_gate_exps.weight")` source.
-- So the **source bytes appear to change between the two reads** — but the mmap is
-  `PROT_READ, MAP_PRIVATE` (read-only, `gguf_reader.hpp:461`), so it cannot be written.
-- Ruled out: the LRU slot management is correct (a double-assignment guard never fired; no
-  race — the copies are synchronous; no vector reallocation — all slots are allocated up front).
-- The fresh-per-use path (local vector, the current default) is exact and gives 200058.
+### The expert-cache mystery — SOLVED
+The persistent F32 LRU (`Model::cached_expert` in `src/minimax/m3_engine.cu`) gave the wrong
+token. **Root cause:** `cached_expert` passed one shared `ty`/`by` to three `raw_slot` calls
+(gate, up, down), so after the calls `ty` was the **down** tensor's type, and gate + up were
+dequantised with the **wrong type**. In this model the three matrices carry **different** ggml
+types: gate/up are `IQ1_M` (type 29), down is `IQ2_XXS` (type 16). Dequantising the `IQ1_M`
+gate/up as `IQ2_XXS` reads the blocks wrong → garbage (−33858). The fresh-per-use path gave each
+matrix its own type → correct (0.0029). The "source bytes changing" was a red herring: the mmap
+source was always identical; the **type** was wrong. `dequant_row` is a pure function of
+(type, src, n), so identical inputs must give identical output — which is what pinned it to the
+type, not the source.
 
-The leading hypotheses to check first:
-1. `raw_slot` / `tensor_data()` returning an **unstable pointer** for the same tensor between
-   calls (check `GgufModel::shard()` and `tensor_data` — does it re-resolve the offset each call,
-   and can that resolution differ?).
-2. An **aliasing** between the cache slot and the mmap that isn't obvious (the slot is a heap
-   `std::vector<float>`, the mmap is a file mapping — they should be disjoint, but verify the
-   slot's `data()` pointer is not within the mmap range).
-3. The dequant reading **out of bounds** (the `n` passed to `dequant_row` vs the actual quantised
-   byte count for that expert type) so it reads adjacent memory that changes.
+**Fix:** `cached_expert` now gives each matrix its own type (`gty`/`uty`/`dty`), matching the
+fresh path. The cache is wired in and opt-in via `--experts N` (default 0 = fresh-per-use,
+byte-identical to before). `cached_expert` returns non-owning pointers to the slot (no ~225 MB
+copy per call), and the loop syncs the stream before each call so a prior async copy out of a
+slot is done before the slot may be evicted. `init_expert_cache` is idempotent so the warm cache
+survives across forwards.
 
-Reproduce with: `strata-m3 --model <shard> --layers 4 --tokens 20768,841,14997,894,275,26225,46 --experts 64`
-and the verify prints in `cached_expert` (re-add them; they were removed for the dormant state).
+**Verified (2026-07-21, one 5060 Ti):** 4-layer logits are bit-identical with the cache on vs
+off; the full 60-layer run with `--experts 256` gives top-1 **200058** (the reference), in
+481 s vs ~720 s without the cache (same day).
 
 ### Remaining for a realistic (fast + correct) run
-1. **The expert cache** — solve the mystery above, then enable it. It should cut the expert FFN
-   from ~1.4 s to the GEMM time (~100 ms) per sparse layer per token.
-2. A higher-precision activation for the quantised path (the Q8_1 activations are not
-   accurate enough for the token; F16 activations would be).
-3. Then: batch > 1, the serve-protocol end-to-end on the GPU path, and the product wiring.
+1. **The expert cache** — DONE (see above): correct and opt-in via `--experts N`. For a single
+   7-token forward it cuts the token from ~720 s to ~481 s (256 slots); a longer generation reuses
+   experts more, so the hit rate (and the win) grows. More slots = more CPU RAM (~226 MB/slot).
 2. A higher-precision activation for the quantised path (the Q8_1 activations are not
    accurate enough for the token; F16 activations would be).
 3. Then: batch > 1, the serve-protocol end-to-end on the GPU path, and the product wiring.
 
-**Measured speed** (2026-07-21, one 5060 Ti, 16 GB, the all-F32 correct path): ~12 min/token
-(720 s), 30.5 GiB peak RSS. The bottleneck is the expert FFN (~1.4 s per token per sparse
-layer: dequantise + upload ~4 routed experts = 904 MB F32, 57 layers × 7 tokens); the
-projections are not the bottleneck. The reference is 2.42 tok/s (417 ms/token, experts in
-RAM, dequantised per use). The correct (all-F32) path is the default; it is a working,
-wired, correct M3 CUDA engine. It is not yet fast.
+**Measured speed** (2026-07-21, one 5060 Ti, 16 GB, the all-F32 correct path, one 7-token
+forward): **491.8 s** without the expert cache, **481.4 s** with `--experts 256` — both give
+top-1 **200058**. The cache is correct but buys little on a single short forward: with 256
+slots and only ~1596 expert-uses (57 sparse layers × 7 tokens × 4 experts), most are first-use
+misses, so the dequant cost is largely unchanged. The win grows with a longer generation (more
+expert reuse → higher hit rate) and a bigger cache (~226 MB CPU RAM per slot). (An earlier 720 s
+figure was a colder, slower run.) The reference is 2.42 tok/s (417 ms/token, experts in RAM,
+dequantised per use). The correct (all-F32) path is the default; it is a working, wired,
+correct M3 CUDA engine. It is not yet fast.

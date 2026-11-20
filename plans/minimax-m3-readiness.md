@@ -229,12 +229,21 @@ the 4 routed experts (904 MB F32) on the fly, 57 sparse layers x 7 tokens. The
 projections are not the bottleneck.
 
 ### Remaining for a realistic (fast + correct) run
-1. **The expert cache**: dequantise each expert once and reuse it (per-forward, CPU-RAM
-   LRU, so repeated forwards are warm). A full F32 cache is large (226 MB/expert; the
-   whole stack is ~464 GB F32, so it must be bounded). This is the main lever for speed.
+1. **The expert cache — implemented but dormant** (2026-07-21). The persistent F32 LRU
+   (dequant each expert once, reuse across tokens and forwards) is the right design and the
+   slot management is verified correct (no double-assignment, no race, no reallocation),
+   but dequantising into the cache slot **corrupts the file-mapped source**: the same expert
+   decodes to −33858 into the slot and 0.0029 into a fresh vector, so the mmap bytes change
+   between reads. The fresh-per-use path (local vector) is exact and is the default. Finding
+   the mmap write is the main lever — it should cut the expert FFN from ~1.4 s to the GEMM
+   time (~100 ms) per sparse layer per token.
 2. A higher-precision activation for the quantised path (the Q8_1 activations are not
    accurate enough for the token; F16 activations would be).
 3. Then: batch > 1, the serve-protocol end-to-end on the GPU path, and the product wiring.
 
-The correct (all-F32) path is the default; it is a working, wired, correct M3 CUDA
-engine. It is not yet fast.
+**Measured speed** (2026-07-21, one 5060 Ti, 16 GB, the all-F32 correct path): ~12 min/token
+(720 s), 30.5 GiB peak RSS. The bottleneck is the expert FFN (~1.4 s per token per sparse
+layer: dequantise + upload ~4 routed experts = 904 MB F32, 57 layers × 7 tokens); the
+projections are not the bottleneck. The reference is 2.42 tok/s (417 ms/token, experts in
+RAM, dequantised per use). The correct (all-F32) path is the default; it is a working,
+wired, correct M3 CUDA engine. It is not yet fast.

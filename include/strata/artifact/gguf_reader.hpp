@@ -428,6 +428,8 @@ public:
         return it == meta_.end() ? nullptr : &it->second;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
+    /// The file's mapping base (a tensor_data pointer minus this is the tensor's file offset).
+    const uint8_t* base() const { return base_; }
 
 private:
     void open() {

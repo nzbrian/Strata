@@ -39,6 +39,7 @@ namespace K = strata::kernels;
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mm = strata::minimax;
@@ -75,6 +76,38 @@ bool to_floats(Q::Type ty, const uint8_t* src, uint64_t n, std::vector<float>& o
     if (!Q::dequant_row(ty, src, out.data(), (int64_t) n)) { err = "dequant failed for type " + std::to_string((int) ty); return false; }
     return true;
 }
+
+// The model's shards in pinned host RAM (see Model::stage_pinned).  A file-scope instance so the staging
+// survives across forwards / decode steps.
+struct PinnedModel {
+    std::vector<void*> pinned;   // one pinned allocation per shard
+    std::vector<size_t> sizes;
+    bool ready = false;
+    void* shard_ptr(size_t i) const { return (ready && i < pinned.size()) ? pinned[i] : nullptr; }
+    bool stage(const strata::GgufModel& g, std::string& err) {
+        if (ready) return true;
+        const size_t n = g.size();
+        pinned.resize(n, nullptr);
+        sizes.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            const size_t sz = (size_t) g.shard(i).file_size();
+            sizes[i] = sz;
+            if (cudaHostAlloc(&pinned[i], sz, cudaHostAllocDefault) != cudaSuccess) {
+                std::fprintf(stderr, "pinned stage  shard %zu (%zu MB): cudaHostAlloc failed, staying on the mmap\n", i, sz >> 20);
+                for (size_t j = 0; j < i; ++j) { cudaFreeHost(pinned[j]); pinned[j] = nullptr; }
+                pinned.clear(); sizes.clear();
+                err = "cudaHostAlloc";
+                return false;
+            }
+            std::fprintf(stderr, "pinned stage  shard %zu: %zu MB (one-time copy at CPU speed)\n", i, sz >> 20);
+            std::fflush(stderr);
+            std::memcpy(pinned[i], g.shard(i).base(), sz);
+        }
+        ready = true;
+        return true;
+    }
+};
+static PinnedModel g_pinned_model;
 
 /// The weights the forward needs, read from the file as float rows and kept only while the layer using them runs.
 class Model {
@@ -233,6 +266,32 @@ class Model {
         bytes = total / t->shape[2];
         return file_->shard(si).tensor_data(*t) + (size_t) expert * bytes;
     }
+
+    /// raw_slot() pointed at pinned RAM when the model is staged there (faster H2D), else at the mmap.
+    const uint8_t* raw_slot_fast(int layer, int expert, const char* what, int64_t& type, uint64_t& bytes, std::string& err) const {
+        const std::string name = "blk." + std::to_string(layer) + "." + what;
+        size_t si = 0;
+        const strata::TensorInfo* t = file_->find(name, &si);
+        if (!t || t->shape.size() < 3) { err = "missing stacked tensor " + name; return nullptr; }
+        if (expert < 0 || (uint64_t) expert >= t->shape[2]) { err = "expert out of range in " + name; return nullptr; }
+        const Q::Type ty = (Q::Type) t->type;
+        const size_t total = Q::row_bytes((int) ty, (int64_t) t->elements());
+        if (total == 0 || t->shape[2] == 0 || total % t->shape[2] != 0) { err = name + ": unequal expert strides"; return nullptr; }
+        type = (int64_t) t->type;
+        bytes = total / t->shape[2];
+        const strata::GgufFile& sh = file_->shard(si);
+        const uint8_t* mmap_ptr = sh.tensor_data(*t) + (size_t) expert * bytes;
+        if (void* pp = g_pinned_model.shard_ptr(si)) {
+            const uint64_t off = (uint64_t)(mmap_ptr - sh.base());
+            return (const uint8_t*) pp + off;
+        }
+        return mmap_ptr;
+    }
+
+    /// Stage the whole model in pinned (page-locked) host RAM so expert H2D copies run at the pinned rate
+    /// (~6 GB/s on the x8 link) instead of the pageable-mmap rate (~2.9 GB/s).  One-time cost: the file size
+    /// copied at CPU speed.  Falls back to the mmap when the pinned allocation fails.
+    bool stage_pinned(std::string& err) { return g_pinned_model.stage(*file_, err); }
 
     mm::LayerDims dims;
     mm::IndexerShape idx;
@@ -415,11 +474,22 @@ bool forward(Model& m, const std::vector<int>& tokens, int n_layers, std::vector
 
 
 // ---------------------------------------------------------------------------
-// VRAM expert LRU (quant path): the quantised bytes of hot experts live in a persistent GPU arena, so a token
+// VRAM expert cache (quant path): the quantised bytes of hot experts live in a persistent GPU arena, so a token
 // whose routing hits a cached expert does no PCIe transfer at all.  A miss streams the expert's quantised bytes
 // from the model file (page cache) through a pinned staging buffer.  Copies and GEMVs share the caller's stream,
 // so stream ordering guarantees a recycled slot is never overwritten while a GEMV still reading it is in flight.
 // The arena outlives every forward (a file-scope instance), so the cache is warm across generated tokens.
+//
+// Eviction is frequency-aware because a single token's working set (228 unique (layer,expert) instances at
+// top-4 x 57 layers) exceeds any practical cache, so plain LRU thrashes: it evicts an expert the token will
+// still need at a later layer.  The fix is to make RECURRING experts (the ones reused across tokens - the only
+// ones a cache can ever save) unevictable:
+//   - every use increments the key's frequency;
+//   - a key used >= kPinThreshold times becomes pinned (never evicted); the pin set is capped at half the
+//     arena so the cold tier can still hold a token's 228-instance working set;
+//   - refresh() (called after a prompt pass, whose routing is free data about generation's needs) re-points the
+//     cache at the highest-frequency experts, evicting only strictly colder unpinned ones - i.e. it accepts
+//     that not all weights are cached and keeps the hottest fraction resident.
 // ---------------------------------------------------------------------------
 struct VramExpertCache {
     void* arena = nullptr;      // n_slots * slot_bytes of quantised expert bytes, [gate | up | down] per slot
@@ -432,9 +502,15 @@ struct VramExpertCache {
     std::list<uint64_t> lru;   // key = (layer<<32)|expert; MRU at the front
     std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_pos;
     std::unordered_map<uint64_t, size_t> slot_of;
+    std::unordered_map<uint64_t, uint32_t> freq;   // uses per key (hits + misses)
+    std::unordered_set<uint64_t> pinned;           // hot experts, never evicted
     uint64_t hits = 0, misses = 0;
+    static constexpr uint32_t kPinThreshold = 8;   // uses that promote a key to pinned
 
     static uint64_t key(int layer, int expert) { return (uint64_t)(uint32_t) layer << 32 | (uint32_t) expert; }
+    static void split(uint64_t k, int& layer, int& expert) {
+        layer = (int)(k >> 32); expert = (int)(k & 0xffffffffu);
+    }
 
     bool init(size_t slots, size_t sbytes) {
         if (arena) return true;   // already warm
@@ -448,11 +524,52 @@ struct VramExpertCache {
         return true;
     }
 
+    // Stream expert (layer, expert)'s quantised bytes into `slot` (caller has secured it).  When the model is
+    // staged in pinned RAM the source is already page-locked, so the bytes go straight to the device.
+    bool load(Model& m, int layer, int expert, size_t slot, cudaStream_t st, std::string& err) {
+        int64_t gt, ut, dt; uint64_t gb, ub, db;
+        const uint8_t *gh = m.raw_slot_fast(layer, expert, "ffn_gate_exps.weight", gt, gb, err),
+                      *uh = m.raw_slot_fast(layer, expert, "ffn_up_exps.weight", ut, ub, err),
+                      *dh = m.raw_slot_fast(layer, expert, "ffn_down_exps.weight", dt, db, err);
+        if (!gh || !uh || !dh) return false;
+        if (gb + ub + db > slot_bytes) { err = "expert does not fit in the vexp slot"; return false; }
+        uint8_t* dst = (uint8_t*) arena + slot * slot_bytes;
+        if (g_pinned_model.ready) {
+            if (cudaMemcpyAsync(dst, gh, (size_t) gb, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+                cudaMemcpyAsync(dst + gb, uh, (size_t) ub, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+                cudaMemcpyAsync(dst + gb + ub, dh, (size_t) db, cudaMemcpyHostToDevice, st) != cudaSuccess) {
+                err = "vexp H2D"; return false;
+            }
+        } else {
+            uint8_t* sp = (uint8_t*) staging;
+            std::memcpy(sp, gh, (size_t) gb);
+            std::memcpy(sp + gb, uh, (size_t) ub);
+            std::memcpy(sp + gb + ub, dh, (size_t) db);
+            if (cudaMemcpyAsync(dst, staging, gb + ub + db, cudaMemcpyHostToDevice, st) != cudaSuccess) { err = "vexp H2D"; return false; }
+        }
+        info[slot] = { (int) gt, (int) ut, (int) dt, gb, ub, db };
+        return true;
+    }
+
+    // Secure a slot for a new key: a free one, or evict the least-recently-used UNPINNED key.  The pin cap
+    // (n_slots/2) guarantees an unpinned victim always exists.
+    bool take_slot(size_t& slot, std::string& err) {
+        if (!free_slots.empty()) { slot = free_slots.back(); free_slots.pop_back(); return true; }
+        auto it = lru.end();
+        for (;;) { --it; if (!pinned.count(*it)) break; }   // terminates: >= half the keys are unpinned
+        const uint64_t old = *it;
+        lru.erase(it); lru_pos.erase(old);
+        slot = slot_of[old]; slot_of.erase(old);   // the stale entry would let two keys share a slot
+        return true;
+    }
+
     // The device pointers + ggml types of expert (layer, expert)'s quantised gate/up/down bytes.  A miss evicts
-    // the LRU victim (or takes a free slot) and streams the bytes in.
+    // an unpinned LRU victim (or takes a free slot) and streams the bytes in.
     bool get(Model& m, int layer, int expert, cudaStream_t st,
              const uint8_t** g, int* gty, const uint8_t** u, int* uty, const uint8_t** d, int* dty, std::string& err) {
         const uint64_t k = key(layer, expert);
+        ++freq[k];
+        if (!pinned.count(k) && freq[k] >= kPinThreshold && pinned.size() < n_slots / 2) pinned.insert(k);
         auto hit = lru_pos.find(k);
         size_t slot;
         if (hit != lru_pos.end()) {
@@ -460,27 +577,10 @@ struct VramExpertCache {
             slot = slot_of.at(k);
             ++hits;
         } else {
-            // the CPU memcpy below overwrites staging; make sure the previous miss's H2D has consumed it
+            // the CPU memcpy in load() overwrites staging; make sure the previous miss's H2D has consumed it
             if (cudaStreamSynchronize(st) != cudaSuccess) { err = "vexp staging sync"; return false; }
-            if (free_slots.empty()) {
-                const uint64_t old = lru.back(); lru.pop_back(); lru_pos.erase(old);
-                slot = slot_of[old]; slot_of.erase(old);   // the stale entry would let two keys share a slot
-            } else {
-                slot = free_slots.back(); free_slots.pop_back();
-            }
-            int64_t gt, ut, dt; uint64_t gb, ub, db;
-            const uint8_t *gh = m.raw_slot(layer, expert, "ffn_gate_exps.weight", gt, gb, err),
-                          *uh = m.raw_slot(layer, expert, "ffn_up_exps.weight", ut, ub, err),
-                          *dh = m.raw_slot(layer, expert, "ffn_down_exps.weight", dt, db, err);
-            if (!gh || !uh || !dh) return false;
-            if (gb + ub + db > slot_bytes) { err = "expert does not fit in the vexp slot"; return false; }
-            uint8_t* sp = (uint8_t*) staging;
-            std::memcpy(sp, gh, (size_t) gb);
-            std::memcpy(sp + gb, uh, (size_t) ub);
-            std::memcpy(sp + gb + ub, dh, (size_t) db);
-            uint8_t* dst = (uint8_t*) arena + slot * slot_bytes;
-            if (cudaMemcpyAsync(dst, staging, gb + ub + db, cudaMemcpyHostToDevice, st) != cudaSuccess) { err = "vexp H2D"; return false; }
-            info[slot] = { (int) gt, (int) ut, (int) dt, gb, ub, db };
+            if (!take_slot(slot, err)) return false;
+            if (!load(m, layer, expert, slot, st, err)) return false;
             lru.push_front(k); lru_pos[k] = lru.begin(); slot_of[k] = slot;
             ++misses;
         }
@@ -490,6 +590,47 @@ struct VramExpertCache {
         *u = base + e.gb;      *uty = e.uty;
         *d = base + e.gb + e.ub; *dty = e.dty;
         return true;
+    }
+
+    // LFU refresh: re-point the cache at the highest-frequency experts.  For each uncached key in descending
+    // frequency order, load it into a free slot or by evicting the coldest UNPINNED cached key - but only if
+    // that key is strictly colder (once nothing colder remains, the cache already holds the top-f experts and
+    // the rest of the ranking cannot improve it).  Used after a prompt pass, whose routing is free data about
+    // which experts generation will want.  Returns the number of experts loaded.
+    size_t refresh(Model& m, cudaStream_t st, std::string& err) {
+        std::vector<std::pair<uint32_t, uint64_t>> ranked;   // (freq, key)
+        ranked.reserve(freq.size());
+        for (const auto& kv : freq) ranked.emplace_back(kv.second, kv.first);
+        std::sort(ranked.begin(), ranked.end(), std::greater<std::pair<uint32_t, uint64_t>>());
+        size_t loaded = 0;
+        for (const auto& rf : ranked) {
+            const uint32_t f = rf.first;
+            const uint64_t k = rf.second;
+            if (lru_pos.count(k)) continue;   // already resident
+            size_t slot = 0;
+            if (!free_slots.empty()) {
+                slot = free_slots.back(); free_slots.pop_back();
+            } else {
+                // the coldest unpinned cached key; skip the refresh if it is not strictly colder than `k`
+                uint64_t victim = 0; uint32_t worst = 0; bool have = false;
+                for (const uint64_t ck : lru) {
+                    if (pinned.count(ck)) continue;
+                    const uint32_t cf = freq.count(ck) ? freq[ck] : 0;
+                    if (!have || cf < worst) { worst = cf; victim = ck; have = true; }
+                }
+                if (!have || worst >= f) break;   // the cache holds the top-frequency experts
+                lru.erase(lru_pos[victim]); lru_pos.erase(victim);
+                slot = slot_of[victim]; slot_of.erase(victim);
+            }
+            int layer, expert;
+            split(k, layer, expert);
+            if (cudaStreamSynchronize(st) != cudaSuccess) { err = "vexp refresh sync"; return loaded; }
+            if (!load(m, layer, expert, slot, st, err)) return loaded;
+            lru.push_front(k); lru_pos[k] = lru.begin(); slot_of[k] = slot;
+            ++loaded;
+        }
+        cudaStreamSynchronize(st);
+        return loaded;
     }
 };
 static VramExpertCache g_vexp;
@@ -510,6 +651,14 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
     // (~13 MB) with room for the file's widest type
     if (use_quant && vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) {
         err = "vexp arena allocation failed"; return false;
+    }
+    // stage the model in pinned RAM for fast expert H2D (one-time; M3_NOSTAGE=1 disables)
+    if (use_quant && !g_pinned_model.ready && getenv("M3_NOSTAGE") == nullptr) {
+        const auto ts = std::chrono::steady_clock::now();
+        std::string serr;
+        if (m.stage_pinned(serr)) std::fprintf(stderr, "pinned stage  model staged in %.1f s\n", secs(ts));
+        else std::fprintf(stderr, "pinned stage  disabled (%s); experts stream from the mmap\n", serr.c_str());
+        std::fflush(stderr);
     }
     cudaStream_t st;
     if (cudaStreamCreate(&st) != cudaSuccess) { err = "cudaStreamCreate"; return false; }
@@ -788,11 +937,12 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                         if (die("vexp")) return false;
                     } else if (use_quant) {
                         // stream the expert's raw quantised bytes to the pool (a few MB, ~15x less than the F32
-                        // matrices) and run the quant-weight x float-activation GEMV on the GPU
+                        // matrices) and run the quant-weight x float-activation GEMV on the GPU.  raw_slot_fast
+                        // sources the bytes from pinned RAM when staged (faster H2D).
                         int64_t gty, uty, dty; uint64_t gb, ub, db;
-                        const uint8_t *gh = m.raw_slot(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
-                                      *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
-                                      *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
+                        const uint8_t *gh = m.raw_slot_fast(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
+                                      *uh = m.raw_slot_fast(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
+                                      *dhb = m.raw_slot_fast(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
                         if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
                         cudaMemcpyAsync(exp_g, gh, (size_t) gb, cudaMemcpyHostToDevice, st);
                         cudaMemcpyAsync(exp_u, uh, (size_t) ub, cudaMemcpyHostToDevice, st);
@@ -931,6 +1081,15 @@ void m3_decode_free(M3DecodeState& ds) {
 
 bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, std::string& err) {
     if (ds.ready) m3_decode_free(ds);
+    // stage the model in pinned RAM so expert H2D runs at the pinned rate (one-time, ~file-size / CPU-copy
+    // speed); M3_NOSTAGE=1 disables it (experts then stream from the pageable mmap)
+    if (use_quant && !g_pinned_model.ready && getenv("M3_NOSTAGE") == nullptr) {
+        const auto ts = std::chrono::steady_clock::now();
+        std::string serr;
+        if (m.stage_pinned(serr)) std::fprintf(stderr, "pinned stage  model staged in %.1f s\n", secs(ts));
+        else std::fprintf(stderr, "pinned stage  disabled (%s); experts stream from the mmap\n", serr.c_str());
+        std::fflush(stderr);
+    }
     const int NE = m.dims.n_embd, H = m.dims.n_head, HKV = m.dims.n_head_kv, HD = m.dims.head_dim;
     const int NFF = (int) m.geom.n_ff;
     const int nL = (int) m.geom.n_layers;
@@ -1060,18 +1219,23 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
 
     std::vector<float> scores((size_t) m.geom.n_expert), dh_host(NE), bias_host((size_t) m.geom.n_expert);
     const bool dtrace = getenv("M3_TRACE") != nullptr;
+    const bool tprof = getenv("M3_TPROFILE") != nullptr;
     char dts_buf[64];
     auto dts = [&](const char* w, int l = -1) {
         if (l < 0) std::snprintf(dts_buf, sizeof dts_buf, "[step] %s", w);
         else std::snprintf(dts_buf, sizeof dts_buf, "[step] %s l=%d", w, l);
         std::fprintf(stderr, "%s\n", dts_buf); std::fflush(stderr);
     };
+    // per-section ms accumulators (M3_TPROFILE): attn | ffn = router (incl. D2H+sync) | routed experts | shared expert
+    double ms_attn = 0.0, ms_exp = 0.0, ms_router = 0.0, ms_routed = 0.0, ms_shared = 0.0;
+    auto now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     int sparse_idx = 0;
     for (int l = 0; l < ds.nL; ++l) {
         if (dtrace) dts("layer begin", l);
         const auto& L = ds.layers[l];
         const bool sparse = l >= ds.dense_lead;
         float* xt = dx;
+        const double t_l0 = tprof ? now_ms() : 0.0;
         // ---- attention ----
         m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.an, dh, NE, (float) m.geom.rms_eps);
         if (die("rms1")) return false;
@@ -1119,6 +1283,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
         if (!mmf(L.wo, da, do_, H * HD, NE)) return false;
         m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, do_, NE);
         if (die("add1")) return false;
+        const double t_attn_end = tprof ? now_ms() : 0.0;
         // ---- FFN ----
         if (!sparse) {
             m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.fn, dh, NE, (float) m.geom.rms_eps);
@@ -1129,6 +1294,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
             if (die("dense_ffn")) return false;
         } else {
+            const double t_router0 = tprof ? now_ms() : 0.0;
             m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.fn, dh, NE, (float) m.geom.rms_eps);
             // router on the GPU (resident F32 weights), scores back to the host for the top-k
             float* dr = nullptr;
@@ -1139,6 +1305,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             cudaStreamSynchronize(st);
             cudaFree(dr);
             if (die("router")) return false;
+            const double t_routed0 = tprof ? now_ms() : 0.0;
             mm::MoEWeights mw;
             mw.n_expert = (int) m.geom.n_expert; mw.n_expert_used = (int) m.geom.n_expert_used;
             mw.n_ff = NFF; mw.n_embd = NE; mw.scale = 2.0f; mw.norm = true;
@@ -1160,11 +1327,12 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                     if (die("vexp")) return false;
                 } else {
                     int64_t gty, uty, dty; uint64_t gb, ub, db;
-                    const uint8_t *gh = m.raw_slot(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
-                                  *uh = m.raw_slot(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
-                                  *dhb = m.raw_slot(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
+                    const uint8_t *gh = m.raw_slot_fast(l, r.experts[s], "ffn_gate_exps.weight", gty, gb, err),
+                                  *uh = m.raw_slot_fast(l, r.experts[s], "ffn_up_exps.weight", uty, ub, err),
+                                  *dhb = m.raw_slot_fast(l, r.experts[s], "ffn_down_exps.weight", dty, db, err);
                     if (!gh || !uh || !dhb) { err = "expert " + std::to_string(r.experts[s]) + ": " + err; return false; }
-                    // one-shot streaming through a device pool (the no-LRU decode path)
+                    // one-shot streaming through a device pool (the no-LRU decode path); raw_slot_fast sources
+                    // the bytes from pinned RAM when the model is staged there (~2x the pageable-mmap H2D rate)
                     static void* pool_g = nullptr; static void* pool_u = nullptr; static void* pool_d = nullptr;
                     static size_t pool_sz = 0;
                     const size_t need_gu = (size_t) NFF * 4096, need_d = (size_t) NE * 4096;
@@ -1185,6 +1353,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                     if (die("expert")) return false;
                 }
             }
+            const double t_shared0 = tprof ? now_ms() : 0.0;
             // shared expert (weight 1)
             if (!mmf(L.sg, dh, dgate, NE, NFF)) return false;
             if (!mmf(L.su, dh, dup, NE, NFF)) return false;
@@ -1193,10 +1362,26 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, 1.0f, NE);
             m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
             if (die("moe_ffn")) return false;
+            if (tprof) {
+                ms_router += (t_routed0 - t_router0);
+                ms_routed += (t_shared0 - t_routed0);
+                ms_shared += (now_ms() - t_shared0);
+            }
+        }
+        if (tprof) {
+            const double t_end = now_ms();
+            ms_attn += (t_attn_end - t_l0);
+            ms_exp += (t_end - t_attn_end);
         }
         if (dtrace) dts("layer end", l);
     }
+    if (tprof) {
+        std::fprintf(stderr, "[tprof] step P=%d attn=%.1fms ffn=%.1fms [router=%.1f routed=%.1f shared=%.1f]\n",
+                     P, ms_attn, ms_exp, ms_router, ms_routed, ms_shared);
+        std::fflush(stderr);
+    }
     ds.n_pos = P + 1;
+    const double t_head0 = tprof ? now_ms() : 0.0;
     // ---- final norm + head ----
     m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(dx, ds.out_norm, dh, NE, (float) m.geom.rms_eps);
     if (!mmf(ds.head, dh, dout, NE, (int) m.geom.n_vocab)) { err = "head"; return false; }
@@ -1204,6 +1389,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
     cudaMemcpyAsync(logits.data(), dout, (size_t) m.geom.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
     if (die("head copy")) return false;
+    if (tprof) std::fprintf(stderr, "[tprof] head+logits=%.1fms (total step so far: see attn/ffn above)\n", now_ms() - t_head0);
     // free step scratch
     cudaFree(dx); cudaFree(dh); cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(da); cudaFree(do_);
     cudaFree(dgate); cudaFree(dup); cudaFree(dhh); cudaFree(df); cudaFree(dout);
@@ -1372,6 +1558,16 @@ int run(int argc, char** argv) {
                 if (trace) { tstamp(); ++trace_seq; }
                 if (!m3_decode_step(m, ds, vexp_slots, ids[i], logits, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); ok = false; break; }
             }
+            // the prompt's routing is free data about which experts generation will want: re-point the expert
+            // cache at the hottest ones (LFU refresh) before the first generated token
+            if (ok && vexp_slots > 0) {
+                const auto tw0 = std::chrono::steady_clock::now();
+                const size_t nloaded = g_vexp.refresh(m, nullptr, err);
+                std::fprintf(stderr, "vexp refresh  %zu experts loaded in %.2f s (%zu pinned, %zu slots, %llu/%llu uses hit so far)\n",
+                             nloaded, secs(tw0), g_vexp.pinned.size(), g_vexp.n_slots,
+                             (unsigned long long) g_vexp.hits, (unsigned long long) (g_vexp.hits + g_vexp.misses));
+                std::fflush(stderr);
+            }
             if (ok) {
                 for (int g = 0; g < max_new; ++g) {
                     int best = 0;
@@ -1396,6 +1592,13 @@ int run(int argc, char** argv) {
                 std::fflush(stdout);
                 ids.push_back(best);
             }
+        }
+        if (use_gpu && use_quant && vexp_slots > 0) {
+            const uint64_t t_use = g_vexp.hits + g_vexp.misses;
+            std::fprintf(stderr, "vexp cache    %zu slots, %zu pinned, %llu/%llu total uses hit (%.1f%%)\n",
+                         g_vexp.n_slots, g_vexp.pinned.size(), (unsigned long long) g_vexp.hits,
+                         (unsigned long long) t_use, t_use ? 100.0 * (double) g_vexp.hits / (double) t_use : 0.0);
+            std::fflush(stderr);
         }
         std::printf("DONE %d %zu %.1f 0.0 %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", (long long) produced.size(), ids.size(),
                     secs(t0), produced.empty() ? "" : "stop", ids.size(), (long long) 0);

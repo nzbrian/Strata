@@ -150,4 +150,78 @@ __global__ void k_swiglu_oai(const float* __restrict__ gate, const float* __rest
     h[base + i] = g * sig * (1.0f + u);
 }
 
+/// Convert one KV block of F16 (pinned-RAM staging, H2D'd) to the F32 pool slot. n = blk*HKV*HD.
+__global__ void k_f16_to_f32(const __half* __restrict__ x, float* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __half2float(x[i]);
+}
+
+/// MSA attention over a per-layer BLOCK POOL (F16, the RAM bytes H2D'd verbatim): the host selected top-k
+/// blocks per GQA group (the union of groups always fits the pool) and built the per-group pool mask.  `sel`
+/// is n_groups*B bytes: sel[g*B+b] = 1 when group g attends to pool block b.  `last_slot`/`last_valid` mark
+/// the pool slot holding the in-progress block (positions past last_valid are padding) and -1 when none.
+/// One thread per output element, online softmax in double, same recipe as k_msa_attn.
+__global__ void k_msa_attn_pool(const float* __restrict__ q, const float* __restrict__ pk, const float* __restrict__ pv,
+                                const unsigned char* __restrict__ sel, float* __restrict__ out,
+                                int H, int HKV, int HD, int B, int blk, int last_slot, int last_valid) {
+    // Flash-decode style: 128 threads per head split the B*blk (block,position) pairs; scores and weights
+    // live in dynamic shared memory (64KB - opt-in required). F32 throughout: F64 on consumer cards runs at
+    // 1/64 rate and this kernel is on the hot path of every decode step.
+    extern __shared__ float smem[];
+    const int N = B * blk;
+    float* s_s = smem;          // [N] scores
+    float* s_w = smem + N;      // [N] softmax weights
+    const int h = blockIdx.x;
+    const int t = threadIdx.x;
+    const int hkv = h / (H / HKV);
+    const float* qh = q + (size_t) h * HD;
+    const float scale = rsqrtf((float) HD);
+    for (int i = t; i < N; i += 128) {
+        const int b = i / blk, p = i - b * blk;
+        if (!sel[(size_t) hkv * B + b] || p >= (b == last_slot ? last_valid : blk)) { s_s[i] = -1e30f; continue; }
+        const float* krow = pk + ((size_t) b * blk + p) * HKV * HD + (size_t) hkv * HD;
+        float s = 0.f;
+        #pragma unroll
+        for (int j = 0; j < HD; ++j) s += qh[j] * krow[j];
+        s_s[i] = s * scale;
+    }
+    __syncthreads();
+    // block max
+    float mx = -1e30f;
+    for (int i = t; i < N; i += 128) mx = fmaxf(mx, s_s[i]);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((t & 31) == 0) smem[N + 2 * (t >> 5)] = mx;
+    __syncthreads();
+    if (t == 0) {
+        float m2 = smem[N + 2 * 0];
+        #pragma unroll
+        for (int w2 = 1; w2 < 4; ++w2) m2 = fmaxf(m2, smem[N + 2 * w2]);
+        smem[N + 2 * 0] = m2;
+    }
+    __syncthreads();
+    mx = smem[N + 2 * 0];
+    // weights + block sum
+    float ls = 0.f;
+    for (int i = t; i < N; i += 128) { const float w = (s_s[i] < -1e29f) ? 0.f : expf(s_s[i] - mx); s_w[i] = w; ls += w; }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, o);
+    if ((t & 31) == 0) smem[N + 2 * 1 + (t >> 5)] = ls;
+    __syncthreads();
+    if (t == 0) {
+        float l2 = smem[N + 2 * 1];
+        #pragma unroll
+        for (int w2 = 1; w2 < 4; ++w2) l2 += smem[N + 2 * 1 + w2];
+        smem[N + 2 * 1] = l2;
+    }
+    __syncthreads();
+    const float l = smem[N + 2 * 1];
+    // out[t] = sum_i s_w[i] * v[i][t]
+    const float* vcol = pv + (size_t) hkv * HD + t;
+    float acc = 0.f;
+    for (int i = 0; i < N; ++i) acc += s_w[i] * vcol[(size_t) i * HKV * HD];
+    out[(size_t) h * HD + t] = acc * (l > 0.f ? 1.f / l : 0.f);
+}
+
+/// y[o] = sum_i W[o* n_in + i] * x[i], F32 weight (for the few F32 projections, e.g. the k/v of M3).
 }  // namespace m3k

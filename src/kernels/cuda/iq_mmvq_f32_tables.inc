@@ -803,3 +803,8 @@ __device__ const unsigned int dev_iq3xxs_grid[256] = {
 __device__ const signed char dev_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
+
+// E2M1 4-bit float values (NVFP4/MXFP4 payload)
+__device__ const signed char dev_kvalues_fp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+};

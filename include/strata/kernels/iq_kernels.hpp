@@ -29,6 +29,9 @@ void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_i
 /// (n_in values).  Q8_1 activations are not accurate enough over many MoE layers; this dequantises each weight
 /// row to shared memory and dots in float.  Handles Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ1_M.
 void iq_mmvq_f32(int ggml_type, const void* w, const float* x, float* y, int n_in, int n_out, void* stream);
+    void iq_mmvq_f32_batch(int E, const void* const w[], int ggml_type, int n_in, int n_out,
+                       const float* x, float* y, void* stream);
+    void iq_mmvq_f32_fused(int type, const void* w, const float* x, float* y, int n_in, int n_out, void* stream);
 
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).

@@ -1,3 +1,4 @@
+#include <cuda_fp16.h>
 // src/kernels/cuda/iq_mmvq_f32.cu - quantised-weight x FLOAT-activation GEMV for decode.
 //
 // iq_mmvq (iq_kernels.cu) reads the same quantised weights but takes a Q8_1 activation, the llama.cpp CUDA
@@ -171,6 +172,28 @@ __device__ __forceinline__ void dq_iq4_xs_one(const block_iq4_xs* x, float* y) {
     }
 }
 
+// ggml's ue4m3 (NVFP4 sub-block scales) decoder, halved as ggml does (src/quant/internal.hpp's ue4m3_formula).
+__device__ __forceinline__ float ue4m3_dev(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int exp = (x >> 3) & 0xF, man = x & 0x7;
+    const float raw = exp == 0 ? exp2f(-9.0f) * (float) man : exp2f((float) exp - 7.0f) * (1.0f + (float) man / 8.0f);
+    return raw * 0.5f;
+}
+
+__device__ __forceinline__ void dq_nvfp4_one(const block_nvfp4* x, float* y) {
+#pragma unroll
+    for (int s = 0; s < QK_NVFP4 / QK_NVFP4_SUB; ++s) {
+        const float d = ue4m3_dev(x->d[s]);
+#pragma unroll
+        for (int j = 0; j < QK_NVFP4_SUB / 2; ++j) {
+            const int v0 = dev_kvalues_fp4[x->qs[s * (QK_NVFP4_SUB / 2) + j] & 0x0F];
+            const int v1 = dev_kvalues_fp4[x->qs[s * (QK_NVFP4_SUB / 2) + j] >> 4];
+            y[s * QK_NVFP4_SUB + j + 0] = v0 * d;
+            y[s * QK_NVFP4_SUB + j + QK_NVFP4_SUB / 2] = v1 * d;
+        }
+    }
+}
+
 __device__ __forceinline__ void dq_q2_K_one(const block_q2_K* x, float* y) {
     const float d = fp16_to_fp32(x->d);
     const float mn = fp16_to_fp32(x->dmin);
@@ -329,6 +352,7 @@ __device__ int dequant_block(int type, const uint8_t* wrow, int bi, float* sw) {
         case 17: { const auto* b = (const block_iq2_xs*)  wrow; dq_iq2_xs_one (&b[bi], sw + bi * QK_K);  return QK_K;  }
         case 18: { const auto* b = (const block_iq3_xxs*) wrow; dq_iq3_xxs_one(&b[bi], sw + bi * QK_K);  return QK_K;  }
         case 23: { const auto* b = (const block_iq4_xs*)  wrow; dq_iq4_xs_one (&b[bi], sw + bi * QK_K);  return QK_K;  }
+        case 40: { const auto* b = (const block_nvfp4*)   wrow; dq_nvfp4_one  (&b[bi], sw + bi * QK_NVFP4); return QK_NVFP4; }
         case 29: { const auto* b = (const block_iq1_m*)   wrow; dq_iq1_m_one  (&b[bi], sw + bi * QK_K);  return QK_K;  }
         default: return 0;
     }
@@ -337,19 +361,27 @@ __device__ int dequant_block(int type, const uint8_t* wrow, int bi, float* sw) {
 // y[n] = W[n] . x for n in [0, n_out): W is n_out rows of n_in quantised values (row `row_bytes`), x a float
 // activation of n_in.  One block per output row; the row is dequantised to shared memory, then dotted in float.
 // (x is the same for every row and stays L2-resident.)
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(512)
 mmvq_f32_kernel(const uint8_t* __restrict__ w, size_t row_bytes, int type,
                 const float* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
-    const int n = blockIdx.x;
+    // Row-parallel: SPLIT blocks share one output row (block `r*SPLIT+p` owns input range [p*seg, (p+1)*seg)).
+    // A whole row in F32 shared memory (48 KB at the dense width) pinned one block per SM at 25% thread
+    // occupancy; a third of a row (16 KB) lets six blocks co-reside.  Partials merge with atomicAdd.
+    const int SPLIT = 1;
+    const int n = blockIdx.x / SPLIT;
+    const int p = blockIdx.x % SPLIT;
     if (n >= n_out) return;
     extern __shared__ float sw[];
+    const int qk = (type == 8) ? QK8_0 : (type == 40) ? QK_NVFP4 : QK_K;
+    const int seg = n_in / SPLIT;              // multiple of every QK for the M3 widths (6144, 12288, ...)
+    const int i0 = p * seg;
     const uint8_t* wrow = w + (size_t) n * row_bytes;
-    const int qk = (type == 8) ? QK8_0 : QK_K;
-    const int nb = n_in / qk;
-    for (int bi = threadIdx.x; bi < nb; bi += blockDim.x) dequant_block(type, wrow, bi, sw);
+    const int nb = seg / qk;
+    // dequant_block writes block `b` at `out + b*qk`; hand it a base shifted so segment block 0 lands at sw[0]
+    for (int bi = threadIdx.x; bi < nb; bi += blockDim.x) dequant_block(type, wrow, i0 / qk + bi, sw - (i0 / qk) * qk);
     __syncthreads();
     float acc = 0.f;
-    for (int i = threadIdx.x; i < n_in; i += blockDim.x) acc += sw[i] * x[i];
+    for (int i = threadIdx.x; i < seg; i += blockDim.x) acc += sw[i] * x[i0 + i];
     __shared__ float warp_sum[32];
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
     if ((threadIdx.x & 31) == 0) warp_sum[threadIdx.x >> 5] = acc;
@@ -362,15 +394,133 @@ mmvq_f32_kernel(const uint8_t* __restrict__ w, size_t row_bytes, int type,
 }
 
 void iq_mmvq_f32(int ggml_type, const void* w, const float* x, float* y, int n_in, int n_out, void* stream) {
+    if (ggml_type == 17 || ggml_type == 18) { iq_mmvq_f32_fused(ggml_type, w, x, y, n_in, n_out, stream); return; }
     const size_t row_bytes = iq_row_bytes(ggml_type, n_in);
     if (row_bytes == 0) return;   // unsupported type or n_in not a whole number of blocks
-    const size_t shmem = (size_t) n_in * sizeof(float);
-    // dynamic + the kernel's 128 B static warp_sum must fit the 48 KB per-block ceiling: the dense-lead
-    // down-projection (n_in = 12288) requests exactly 48 KB dynamic and needs the opt-in to launch.
+    const int SPLIT = 1;
+    const size_t shmem = (size_t) (n_in / SPLIT) * sizeof(float);
     static bool opted = false;
     if (!opted && shmem >= 48u << 10) { cudaFuncSetAttribute(mmvq_f32_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem); opted = true; }
-    mmvq_f32_kernel<<<n_out, 256, shmem, (cudaStream_t) stream>>>(
+    mmvq_f32_kernel<<<n_out * SPLIT, 512, shmem, (cudaStream_t) stream>>>(
         (const uint8_t*) w, row_bytes, ggml_type, x, y, n_in, n_out);
+}
+
+
+// Fused dequant-and-dot for the expert-heavy types (IQ2_XS gate/up, IQ3_XXS down in the UD-Q*_XL mixes):
+// no shared memory, no barriers - 128 threads per row stride over 32-value sub-blocks, dequantising inline
+// and accumulating against the F32 activation.  The smem kernel above stays for the other types.
+__device__ __forceinline__ float fused_dot_iq2xs_sub(const block_iq2_xs* blk, int ib32, const float* x) {
+    const float d = fp16_to_fp32(blk->d);
+    const float db0 = d * (0.5f + (blk->scales[ib32] & 0xf)) * 0.25f;
+    const float db1 = d * (0.5f + (blk->scales[ib32] >> 4)) * 0.25f;
+    const uint16_t* qs = blk->qs + 4 * ib32;
+    float acc = 0.f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint16_t q = qs[l];
+        const int8_t* grid = (const int8_t*) (dev_iq2xs_grid + (q & 511));
+        const uint8_t signs = dev_ksigns_iq2xs[q >> 9];
+        const float sdb = (l < 2) ? db0 : db1;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            acc += sdb * (signs & dev_kmask_iq2xs[j] ? -grid[j] : grid[j]) * x[l * 8 + j];
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float fused_dot_iq3xxs_sub(const block_iq3_xxs* blk, int ib32, const float* x) {
+    const float d = fp16_to_fp32(blk->d);
+    const uint8_t* qs = blk->qs + 8 * ib32;
+    const uint8_t* sb = blk->qs + QK_K / 4 + 4 * ib32;   // sas, byte-wise (unaligned on the 98-byte stride)
+    const uint32_t aux32 = (uint32_t) sb[0] | ((uint32_t) sb[1] << 8) | ((uint32_t) sb[2] << 16) | ((uint32_t) sb[3] << 24);
+    const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+    float acc = 0.f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint8_t signs = dev_ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+        const int8_t* g1 = (const int8_t*) (dev_iq3xxs_grid + qs[2 * l + 0]);
+        const int8_t* g2 = (const int8_t*) (dev_iq3xxs_grid + qs[2 * l + 1]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc += db * (signs & dev_kmask_iq2xs[j + 0] ? -g1[j] : g1[j]) * x[l * 8 + j + 0];
+            acc += db * (signs & dev_kmask_iq2xs[j + 4] ? -g2[j] : g2[j]) * x[l * 8 + j + 4];
+        }
+    }
+    return acc;
+}
+
+template <typename BlockT, float (*DOT)(const BlockT*, int, const float*)>
+__global__ void __launch_bounds__(128) mmvq_f32_fused_kernel(const BlockT* __restrict__ w,
+                                                             const float* __restrict__ x, float* __restrict__ y,
+                                                             int n_sub, int n_blk, int n_out) {
+    const int n = blockIdx.x;
+    if (n >= n_out) return;
+    const BlockT* wrow = w + (size_t) n * n_blk;           // n_blk 256-value blocks per row
+    float acc = 0.f;
+    for (int s = threadIdx.x; s < n_sub; s += blockDim.x)
+        acc += DOT(wrow + s / 8, s % 8, x + s * 32);
+    __shared__ float warp_sum[4];
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & 31) == 0) warp_sum[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = warp_sum[0] + warp_sum[1] + warp_sum[2] + warp_sum[3];
+        y[n] = v;
+    }
+}
+
+void iq_mmvq_f32_fused(int type, const void* w, const float* x, float* y, int n_in, int n_out, void* stream) {
+    if (type == 17) {
+        mmvq_f32_fused_kernel<block_iq2_xs, fused_dot_iq2xs_sub><<<n_out, 128, 0, (cudaStream_t) stream>>>(
+            (const block_iq2_xs*) w, x, y, n_in / 32, n_in / 256, n_out);
+    } else if (type == 18) {
+        mmvq_f32_fused_kernel<block_iq3_xxs, fused_dot_iq3xxs_sub><<<n_out, 128, 0, (cudaStream_t) stream>>>(
+            (const block_iq3_xxs*) w, x, y, n_in / 32, n_in / 256, n_out);
+    }
+}
+
+// Batched GEMV: E experts (same type/shape, weight bases in `w[E]`) in one launch.  grid = E*n_out,
+// block (e, r) dots row r of expert e.  Lets a layer's four routed experts be copied in first and then
+// computed back-to-back with no copy/compute serialization between experts.
+extern "C" __global__ void __launch_bounds__(512)
+mmvq_f32_batch(const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
+               const uint8_t* __restrict__ w2, const uint8_t* __restrict__ w3,
+               size_t row_bytes, int type,
+               const float* __restrict__ x, float* __restrict__ y, int n_in, int n_out, int E) {
+    const int e = blockIdx.x / n_out;
+    const int n = blockIdx.x % n_out;
+    const uint8_t* wrow = (e == 0 ? w0 : e == 1 ? w1 : e == 2 ? w2 : w3) + (size_t) n * row_bytes;
+    extern __shared__ float sw[];
+    const int qk = (type == 8) ? QK8_0 : (type == 40) ? QK_NVFP4 : QK_K;
+    const int nb = n_in / qk;
+    for (int bi = threadIdx.x; bi < nb; bi += blockDim.x) dequant_block(type, wrow, bi, sw);
+    __syncthreads();
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) acc += sw[i] * x[i];
+    __shared__ float warp_sum[32];
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & 31) == 0) warp_sum[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x >> 5)) ? warp_sum[threadIdx.x] : 0.f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+        if (threadIdx.x == 0) y[(size_t) e * n_out + n] = v;
+    }
+}
+
+void iq_mmvq_f32_batch(int E, const void* const w[], int ggml_type, int n_in, int n_out,
+                       const float* x, float* y, void* stream) {
+    const size_t row_bytes = iq_row_bytes(ggml_type, n_in);
+    if (row_bytes == 0) return;
+    const size_t shmem = (size_t) n_in * sizeof(float);
+    static bool opted = false;
+    if (!opted && shmem >= 48u << 10) { cudaFuncSetAttribute(mmvq_f32_batch, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem); opted = true; }
+    const uint8_t* w0 = E > 0 ? (const uint8_t*) w[0] : nullptr;
+    const uint8_t* w1 = E > 1 ? (const uint8_t*) w[1] : nullptr;
+    const uint8_t* w2 = E > 2 ? (const uint8_t*) w[2] : nullptr;
+    const uint8_t* w3 = E > 3 ? (const uint8_t*) w[3] : nullptr;
+    mmvq_f32_batch<<<(size_t) E * n_out, 512, shmem, (cudaStream_t) stream>>>(
+        w0, w1, w2, w3, row_bytes, ggml_type, x, y, n_in, n_out, E);
 }
 
 }  // namespace strata::kernels

@@ -568,8 +568,14 @@ struct VramExpertCache {
         cudaSetDevice(dev);
         const cudaError_t e0 = cudaGetLastError();   // flush any sticky error from the device switch
         (void) e0;
-        if (cudaMalloc(&arena, slots * sbytes) != cudaSuccess) { arena = nullptr; return false; }
+        if (cudaMalloc(&arena, slots * sbytes) != cudaSuccess) {
+            std::fprintf(stderr, "  [vexp init] cudaMalloc %zu MB on dev %d: %s\n",
+                         (slots * sbytes) >> 20, dev, cudaGetErrorString(cudaGetLastError()));
+            arena = nullptr; return false;
+        }
         if (cudaHostAlloc(&staging, sbytes, cudaHostAllocDefault) != cudaSuccess) {
+            std::fprintf(stderr, "  [vexp init] cudaHostAlloc %zu MB: %s\n",
+                         sbytes >> 20, cudaGetErrorString(cudaGetLastError()));
             cudaFree(arena); arena = nullptr; return false;
         }
         info.resize(slots);
@@ -687,6 +693,75 @@ struct VramExpertCache {
     }
 };
 static VramExpertCache g_vexp;
+
+// ---- Long-context KV: the sparse layers' K/V and indexer keys live in PINNED RAM (F16 K/V, F32 keys);
+// each token's MSA selection (top-k blocks per GQA group, union <= kPoolBlocks) is gathered into a per-layer
+// GPU block pool, so attention reads only a few MB per layer instead of the whole prefix.  The dense-lead
+// layers keep their full KV on the GPU (few layers, full attention, small total).
+struct RamKv {
+    static constexpr int kPoolBlocks = 64;   // indexer.top_k (16) x n_groups (4): the union always fits
+    // F32, not F16: this MoE's routing flips on F16 KV rounding and the output collapses to token salad.
+    // The per-layer block pools are SHARDED across the three GPUs (layer l's pool lives on GPU l%3), so the
+    // ~3.5 GB F32 pool never sits on one card and the idle VRAM of the two helper GPUs is put to work.
+    static constexpr int kNgpu = 3;
+    float *rk = nullptr, *rv = nullptr;      // [n_sparse][cap][HKV*HD]
+    float *rik = nullptr;                    // [n_sparse][cap][idx_dim]
+    float *pool_k[kNgpu] = { nullptr }, *pool_v[kNgpu] = { nullptr };  // [layers_per_gpu][kPoolBlocks][blk*HKV*HD]
+    cudaStream_t pool_st[kNgpu] = { nullptr };
+    float *q_relay = nullptr, *da_relay = nullptr;   // pinned: GPU0 <-> pool GPU
+    float *pool_q[kNgpu] = { nullptr }, *pool_da[kNgpu] = { nullptr };  // per-pool-GPU q/da (H*HD floats)
+    unsigned char *dsel[kNgpu] = { nullptr };        // per-pool-GPU selection mask
+    int *pool_blk = nullptr, *pool_age = nullptr;  // host LRU state [n_sparse][kPoolBlocks]
+    int n_sparse = 0, cap = 0, n_pos = 0, age = 0, layers_per_gpu = 0;
+    bool ready = false;
+    int gpu_of(int sparse_idx) const { return sparse_idx % kNgpu; }
+    int local_of(int sparse_idx) const { return sparse_idx / kNgpu; }
+    bool init(int ns, int cap_, int HKV, int HD, int idx_dim, int blk, int qhd, std::string& err) {
+        n_sparse = ns; cap = cap_; n_pos = 0;
+        layers_per_gpu = (ns + kNgpu - 1) / kNgpu;
+        const size_t kvb = (size_t) ns * cap * HKV * HD;      // F32 elements
+        const size_t ikb = (size_t) ns * cap * idx_dim;       // F32 elements
+        if (cudaHostAlloc(&rk, kvb * 4, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc(&rv, kvb * 4, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc(&rik, ikb * 4, cudaHostAllocDefault) != cudaSuccess) { err = "ram kv pinned"; return false; }
+        const size_t pob = (size_t) layers_per_gpu * kPoolBlocks * blk * HKV * HD;   // F32 elements per GPU
+        const int smem_bytes = (kPoolBlocks * blk * 2 + 8) * (int) sizeof(float);
+        for (int g = 0; g < kNgpu; ++g) {
+            cudaSetDevice(g);   // each pool lives on its own card; the smem opt-in is per-context
+            if (cudaFuncSetAttribute((const void*) m3k::k_msa_attn_pool, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes) != cudaSuccess ||
+                cudaStreamCreate(&pool_st[g]) != cudaSuccess ||
+                cudaMalloc(&pool_k[g], pob * 4) != cudaSuccess ||
+                cudaMalloc(&pool_v[g], pob * 4) != cudaSuccess ||
+                cudaMalloc(&dsel[g], (size_t) 4 * kPoolBlocks) != cudaSuccess) { err = "ram kv pool"; return false; }
+        }
+        const size_t qbytes = (size_t) qhd * 4;
+        if (cudaHostAlloc(&q_relay, qbytes, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc(&da_relay, qbytes, cudaHostAllocDefault) != cudaSuccess) { err = "ram kv relay"; return false; }
+        for (int g = 0; g < kNgpu; ++g) {
+            cudaSetDevice(g);
+            if (cudaMalloc(&pool_q[g], qbytes) != cudaSuccess || cudaMalloc(&pool_da[g], qbytes) != cudaSuccess) { err = "ram kv q/da"; return false; }
+        }
+        cudaSetDevice(0);
+        pool_blk = new int[ns * kPoolBlocks];
+        pool_age = new int[ns * kPoolBlocks];
+        for (int i = 0; i < ns * kPoolBlocks; ++i) { pool_blk[i] = -1; pool_age[i] = 0; }
+        ready = true;
+        return true;
+    }
+    void free_() {
+        if (rk) { cudaFreeHost(rk); rk = rv = nullptr; }
+        if (rik) { cudaFreeHost(rik); rik = nullptr; }
+        for (int g = 0; g < kNgpu; ++g) {
+            if (pool_k[g]) { cudaFree(pool_k[g]); cudaFree(pool_v[g]); pool_k[g] = pool_v[g] = nullptr; }
+            if (dsel[g]) { cudaFree(dsel[g]); dsel[g] = nullptr; }
+            if (pool_q[g]) { cudaFree(pool_q[g]); cudaFree(pool_da[g]); pool_q[g] = pool_da[g] = nullptr; }
+            if (pool_st[g]) { cudaStreamDestroy(pool_st[g]); pool_st[g] = nullptr; }
+        }
+        if (q_relay) { cudaFreeHost(q_relay); cudaFreeHost(da_relay); q_relay = da_relay = nullptr; }
+        delete[] pool_blk; pool_blk = pool_age = nullptr;
+        ready = false; n_pos = 0;
+    }
+};
 
 /// The GPU forward: the same recipe as forward(), with the projections on the quantised GEMM (iq_mmvq on Q8_1
 /// activations) and the elementwise / attention work on the m3k kernels. Experts are streamed from the mmap (their
@@ -906,11 +981,15 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
             } else {
                 m3k::k_attn<<<H, HD, 0, st>>>(dq2, dkv_k, dkv_v, da, H, HKV, HD, t + 1, cap, t);
             }
+            if (t == T - 1)
+if (getenv("M3_DBG_DA") && l == 3) { std::vector<float> d((size_t) H * HD); cudaMemcpyAsync(d.data(), da, (size_t) H * HD * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); FILE* f = fopen("/tmp/da3_fwd.txt", "w"); for (int i = 0; i < (int) d.size(); ++i) fprintf(f, "%.6f\n", d[i]); fclose(f); }
             if (die("attn")) return false;
             if (g_dump_da && l == 0 && t == T - 1) { g_dump_da_data.resize((size_t) H * HD); cudaMemcpyAsync(g_dump_da_data.data(), da, (size_t) H * HD * sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); }
             // output projection
             if (!mmf(wo, da, hq8, do_, H * HD, NE)) return false;
             m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, do_, NE);
+            if (t == T - 1)
+if (getenv("M3_DBG_XT") && t == T - 1) { std::vector<float> d((size_t) NE); cudaMemcpyAsync(d.data(), xt, (size_t) NE * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); FILE* f = fopen((std::string("/tmp/xt_") + std::to_string(l) + "_fwd.txt").c_str(), "w"); for (int i2 = 0; i2 < (int) d.size(); ++i2) fprintf(f, "%.6f\n", d[i2]); fclose(f); }
             if (die("add1")) return false;
             if (g_dump_xa && l == 0 && t == T - 1) { std::vector<float> d(NE); cudaMemcpyAsync(d.data(), xt, (size_t)NE*sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); std::FILE* f=std::fopen(g_dump_xa,"w"); for(int i=0;i<NE;++i) std::fprintf(f,"%.6f\n",d[i]); std::fclose(f); }
         }
@@ -1106,6 +1185,7 @@ struct M3MultiGpu {
         int dev = -1;
         void *pool_g = nullptr, *pool_u = nullptr, *pool_d = nullptr;   // one expert's quantised bytes
         float *dgate = nullptr, *dup = nullptr, *dhh = nullptr, *do_ = nullptr, *df = nullptr, *h = nullptr;
+        float *dgate_b = nullptr, *dup_b = nullptr, *dhh_b = nullptr, *do_b = nullptr;   // [4][...] grouped-GEMV scratch
         cudaStream_t st = nullptr;
         VramExpertCache cache;      // this GPU's VRAM expert LRU (holds its own id % n_gpus share)
     };
@@ -1141,7 +1221,11 @@ bool m3_multigpu_init(int NE, int NFF, bool use_quant, int n_gpus, int expslots,
             cudaMalloc(&E.dhh, (size_t) NFF * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&E.do_, (size_t) NE * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&E.df, (size_t) NE * sizeof(float)) != cudaSuccess ||
-            cudaMalloc(&E.h, (size_t) NE * sizeof(float)) != cudaSuccess) {
+            cudaMalloc(&E.h, (size_t) NE * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.dgate_b, (size_t) 4 * NFF * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.dup_b, (size_t) 4 * NFF * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.dhh_b, (size_t) 4 * NFF * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&E.do_b, (size_t) 4 * NE * sizeof(float)) != cudaSuccess) {
             err = "extra GPU allocation (device " + std::to_string(dev) + ")"; return false;
         }
         // this GPU's expert LRU: the extra GPUs hold no resident weights, so most of their VRAM is cache.
@@ -1182,9 +1266,10 @@ struct M3DecodeState {
     void* detab = nullptr; int64_t etype = 0; size_t erow = 0;   // embedding table (quantised bytes, device)
     QW head;
     float* out_norm = nullptr;
-    float *dkv_k = nullptr, *dkv_v = nullptr;   // [nL][HKV][cap][HD] each
-    float* didxc = nullptr;                      // [n_sparse][cap][idx.dim]
+    float *dkv_k = nullptr, *dkv_v = nullptr;   // dense-lead layers only: [dense_lead][HKV][cap][HD] each
+    float* didxc = nullptr;                      // unused in long-ctx mode (indexer keys live in ram.rik)
     float* d_part = nullptr;                     // multi-GPU: one extra GPU's partial output (NE floats, GPU0)
+    RamKv ram;                                   // sparse-layer KV + indexer keys in pinned RAM, per-layer GPU block pool
     int cap = 0, n_pos = 0;
     int NE = 0, n_head = 0, HKV = 0, HD = 0, NFF = 0, NFFD = 0, nL = 0, dense_lead = 0, n_sparse = 0;
     int idx_dim = 0, idx_groups = 0, idx_blk = 0, idx_topk = 0, idx_local = 0;
@@ -1221,6 +1306,7 @@ void m3_decode_free(M3DecodeState& ds) {
     if (ds.dkv_k) { cudaFree(ds.dkv_k); ds.dkv_k = nullptr; }
     if (ds.dkv_v) { cudaFree(ds.dkv_v); ds.dkv_v = nullptr; }
     if (ds.didxc) { cudaFree(ds.didxc); ds.didxc = nullptr; }
+    ds.ram.free_();
     if (ds.d_part) { cudaFree(ds.d_part); ds.d_part = nullptr; }
     {
         auto& S = ds.scratch;
@@ -1329,12 +1415,12 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
     }
     if (!upload_quant("output.weight", ds.head)) { err = "output.weight"; return false; }
     if (!upload_f32("output_norm.weight", NE, &ds.out_norm)) { err = "output_norm.weight"; return false; }
-    if (cudaMalloc(&ds.dkv_k, (size_t) nL * HKV * cap * HD * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&ds.dkv_v, (size_t) nL * HKV * cap * HD * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&ds.didxc, (size_t) ds.n_sparse * cap * m.idx.dim * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&ds.d_part, (size_t) NE * sizeof(float)) != cudaSuccess) {
-        err = "KV cache allocation"; return false;
-    }
+    // dense-lead layers keep their full KV on the GPU; the sparse layers' KV + indexer keys go to pinned RAM
+    // (a 250k-context F32 sparse KV would be ~65 GB, long past any card here)
+    if (cudaMalloc(&ds.dkv_k, (size_t) ds.dense_lead * HKV * cap * HD * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&ds.dkv_v, (size_t) ds.dense_lead * HKV * cap * HD * sizeof(float)) != cudaSuccess) { err = "dense KV allocation: " + std::string(cudaGetErrorString(cudaGetLastError())); return false; }
+    if (!ds.ram.init(ds.n_sparse, cap, HKV, HD, m.idx.dim, m.idx.blk, H * HD, err)) { err = "ram kv: " + err; return false; }
+    if (cudaMalloc(&ds.d_part, (size_t) NE * sizeof(float)) != cudaSuccess) { err = "d_part allocation"; return false; }
     {
         auto& S = ds.scratch;
         auto A = [&](float** p, size_t n) { return cudaMalloc(p, n * sizeof(float)) == cudaSuccess; };
@@ -1344,7 +1430,7 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
             !A(&S.dhh, (size_t) std::max(NFF, NFFD)) || !A(&S.df, NE) ||
             !A(&S.dout, (size_t) m.geom.n_vocab) || !A(&S.diq, (size_t) m.idx.n_groups * m.idx.dim) ||
             !A(&S.dik, m.idx.dim) || !A(&S.dq2, (size_t) H * HD) || !A(&S.dk2, (size_t) HKV * HD) ||
-            cudaMalloc(&S.dmask, (size_t) m.idx.n_groups * cap) != cudaSuccess ||
+            cudaMalloc(&S.dmask, (size_t) m.idx.n_groups * RamKv::kPoolBlocks) != cudaSuccess ||   // per-group pool mask
             cudaMalloc(&S.dtok, sizeof(int32_t)) != cudaSuccess) { err = "decode scratch"; return false; }
         if (cudaStreamCreate(&S.st) != cudaSuccess) { err = "decode stream"; return false; }
     }
@@ -1414,12 +1500,16 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
         m3k::k_rms<<<dim3(1, H), HD, 0, st>>>(dq, L.qn, dq2, HD, m.dims.eps);
         m3k::k_rms<<<dim3(1, HKV), HD, 0, st>>>(dk, L.kn, dk2, HD, m.dims.eps);
         m3k::k_rope<<<H + HKV, m.dims.n_rot / 2, 0, st>>>(dq2, dk2, H, HKV, HD, m.dims.n_rot, (float) P, m.dims.rope_base);
+        // Dense-lead layers keep their full KV on the GPU; sparse layers read a per-layer block pool backed by
+        // pinned RAM (a whole-prefix F32 KV would be ~65 GB at 250k context - past any card here).
         float* lkv_k = ds.dkv_k + (size_t) l * HKV * ds.cap * HD;
         float* lkv_v = ds.dkv_v + (size_t) l * HKV * ds.cap * HD;
-        m3k::k_kv_append<<<HKV, HD, 0, st>>>(lkv_k, dk2, HKV, HD, ds.cap, P);
-        m3k::k_kv_append<<<HKV, HD, 0, st>>>(lkv_v, dv, HKV, HD, ds.cap, P);
-        if (sparse) {
-            // MSA indexer: score the key blocks, select top-k, attend to the union
+        if (!sparse) {
+            m3k::k_kv_append<<<HKV, HD, 0, st>>>(lkv_k, dk2, HKV, HD, ds.cap, P);
+            m3k::k_kv_append<<<HKV, HD, 0, st>>>(lkv_v, dv, HKV, HD, ds.cap, P);
+            m3k::k_attn<<<H, HD, 0, st>>>(dq2, lkv_k, lkv_v, da, H, HKV, HD, P + 1, ds.cap, P);
+        } else {
+            // MSA indexer: score the key blocks, select top-k per GQA group
             m3k::k_f32_mm<<<(m.idx.n_groups * m.idx.dim + 127) / 128, 128, 0, st>>>(L.idxq, dh, diq, NE, m.idx.n_groups * m.idx.dim);
             m3k::k_f32_mm<<<(m.idx.dim + 127) / 128, 128, 0, st>>>(L.idxk, dh, dik, NE, m.idx.dim);
             m3k::k_rms<<<dim3(1, m.idx.n_groups), m.idx.dim, 0, st>>>(diq, L.idxqn, diq, m.idx.dim, m.dims.eps);
@@ -1427,30 +1517,123 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             m3k::k_rope<<<m.idx.n_groups, m.dims.n_rot / 2, 0, st>>>(diq, nullptr, m.idx.n_groups, 0, m.idx.dim, m.dims.n_rot, (float) P, m.dims.rope_base);
             m3k::k_rope<<<1, m.dims.n_rot / 2, 0, st>>>(dik, nullptr, 1, 0, m.idx.dim, m.dims.n_rot, (float) P, m.dims.rope_base);
             if (die("indexer rope")) return false;
-            float* lidxc = ds.didxc + (size_t) sparse_idx * ds.cap * m.idx.dim;
-            cudaMemcpyAsync(lidxc + (size_t) P * m.idx.dim, dik, (size_t) m.idx.dim * sizeof(float), cudaMemcpyDeviceToDevice, st);
-            const int npos = P + 1, nblk = (npos + m.idx.blk - 1) / m.idx.blk;
-            std::vector<float> ikc((size_t) npos * m.idx.dim), diqh((size_t) m.idx.n_groups * m.idx.dim);
-            cudaMemcpyAsync(ikc.data(), lidxc, (size_t) npos * m.idx.dim * sizeof(float), cudaMemcpyDeviceToHost, st);
-            cudaMemcpyAsync(diqh.data(), diq, diqh.size() * sizeof(float), cudaMemcpyDeviceToHost, st);
+            auto& ram = ds.ram;
+            auto ck = [&](const char* w) { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); } return e == cudaSuccess; };
+            const double sp0 = tprof ? now_ms() : 0.0;
+            double sp_d2h = 0, sp_score = 0, sp_fetch = 0, sp_relay = 0, sp_kern = 0;
+            const int ns = m.idx.n_groups, idim = m.idx.dim, blk = m.idx.blk, nb = RamKv::kPoolBlocks;
+            const size_t kvn = (size_t) HKV * HD;
+            // one small D2H batch: indexer q/k + this position's k/v (replaces the old O(prefix) indexer copy)
+            std::vector<float> down((size_t) ns * idim + idim + 2 * kvn);
+            cudaMemcpyAsync(down.data(), diq, (size_t) ns * idim * 4, cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(down.data() + (size_t) ns * idim, dik, (size_t) idim * 4, cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(down.data() + (size_t) ns * idim + idim, dk2, kvn * 4, cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(down.data() + (size_t) ns * idim + idim + kvn, dv, kvn * 4, cudaMemcpyDeviceToHost, st);
             cudaStreamSynchronize(st);
-            std::vector<unsigned char> mask((size_t) m.idx.n_groups * npos, 0);   // per GQA group, NOT the union
-            std::vector<float> bscore((size_t) nblk);
-            for (int g = 0; g < m.idx.n_groups; ++g) {
-                mm::block_scores(diqh.data() + (size_t) g * m.idx.dim, ikc.data(), nullptr, npos, m.idx.dim, m.idx.blk, P, m.idx.local, bscore.data());
-                const mm::BlockSel sel = mm::select_blocks(bscore.data(), nblk, m.idx.topk);
-                for (int j = 0; j < sel.n; ++j)
-                    for (int pp = sel.blocks[j] * m.idx.blk; pp < (sel.blocks[j] + 1) * m.idx.blk && pp < npos; ++pp) mask[(size_t) g * npos + pp] = 1;
+            if (tprof) sp_d2h = now_ms() - sp0;
+            // append position P to the pinned-RAM caches (F16 K/V, F32 indexer key)
+            {
+                const float* kh = down.data() + (size_t) ns * idim + idim;
+                const float* vh = down.data() + (size_t) ns * idim + idim + kvn;
+                float* rk_l = ram.rk + ((size_t) sparse_idx * ram.cap + P) * kvn;
+                float* rv_l = ram.rv + ((size_t) sparse_idx * ram.cap + P) * kvn;
+                std::memcpy(rk_l, kh, kvn * 4);
+                std::memcpy(rv_l, vh, kvn * 4);
+                std::memcpy(ram.rik + ((size_t) sparse_idx * ram.cap + P) * idim, down.data() + (size_t) ns * idim, (size_t) idim * 4);   // dik, not dk2
             }
-            cudaMemcpyAsync(dmask, mask.data(), (size_t) m.idx.n_groups * npos, cudaMemcpyHostToDevice, st);
-            m3k::k_msa_attn<<<H, HD, 0, st>>>(dq2, lkv_k, lkv_v, dmask, da, H, HKV, HD, npos, ds.cap);
+            // score blocks against the RAM keys (host side, O(nblk)), select per group, build the union
+            const float* rikc = ram.rik + (size_t) sparse_idx * ram.cap * idim;
+            const int npos = P + 1, nblk = (npos + blk - 1) / blk;
+            std::vector<float> bscore((size_t) nblk);
+            std::vector<mm::BlockSel> sels((size_t) ns);
+            std::vector<int> union_blk;
+            union_blk.reserve((size_t) ns * m.idx.topk);
+            {
+                std::vector<unsigned char> seen((size_t) nblk, 0);   // block indices, up to nblk-1
+                for (int g = 0; g < ns; ++g) {
+                    mm::block_scores(down.data() + (size_t) g * idim, rikc, nullptr, npos, idim, blk, P, m.idx.local, bscore.data());
+                    sels[(size_t) g] = mm::select_blocks(bscore.data(), nblk, m.idx.topk);
+                    for (int j = 0; j < sels[(size_t) g].n; ++j)
+                        if (!seen[sels[(size_t) g].blocks[j]]) { seen[sels[(size_t) g].blocks[j]] = 1; union_blk.push_back(sels[(size_t) g].blocks[j]); }
+                }
+            }
+            if (tprof) sp_score = now_ms() - sp0;
+            // make every selected block resident in the per-layer GPU pool; the in-progress block is always
+            // refetched (it just gained a position); victims are the least-recently-used blocks NOT in the union
+            const int pg = ram.gpu_of(sparse_idx), pl = ram.local_of(sparse_idx);
+            cudaStream_t pst = ram.pool_st[pg];
+            cudaSetDevice(pg);   // all pool-side work happens with this card current
+            int* pblk = ram.pool_blk + (size_t) sparse_idx * nb;
+            int* page = ram.pool_age + (size_t) sparse_idx * nb;
+            const int b_last = P / blk;
+            for (int b : union_blk) {
+                int slot = -1;
+                for (int s = 0; s < nb; ++s) if (pblk[s] == b) { slot = s; break; }
+                bool fresh = false;
+                if (slot < 0) {
+                    int victim = -1;
+                    for (int s = 0; s < nb; ++s) {
+                        bool needed = false;
+                        for (int u : union_blk) if (pblk[s] == u) { needed = true; break; }
+                        if (pblk[s] < 0 || (!needed && (victim < 0 || page[s] < page[victim]))) victim = s;
+                    }
+                    pblk[victim] = b;
+                    slot = victim;
+                    fresh = true;
+                }
+                page[slot] = ++ram.age;
+                if (fresh || b == b_last) {
+                    // the RAM bytes go straight into the pool slot on this layer's pool GPU
+                    const size_t base = (size_t) sparse_idx * ram.cap + (size_t) b * blk;
+                    const float* srck = ram.rk + base * kvn;
+                    const float* srcv = ram.rv + base * kvn;
+                    float* pok = ram.pool_k[pg] + ((size_t) pl * nb + slot) * (size_t) blk * kvn;
+                    float* pov = ram.pool_v[pg] + ((size_t) pl * nb + slot) * (size_t) blk * kvn;
+                    cudaMemcpyAsync(pok, srck, (size_t) blk * kvn * 4, cudaMemcpyHostToDevice, pst);
+                    if (!ck("fetch k H2D")) return false;
+                    cudaMemcpyAsync(pov, srcv, (size_t) blk * kvn * 4, cudaMemcpyHostToDevice, pst);
+                    if (!ck("fetch v H2D")) return false;
+                }
+            }
+            // per-group pool mask + the in-progress block's valid length (its tail is unwritten padding)
+            std::vector<unsigned char> sel_pool((size_t) ns * nb, 0);
+            for (int g = 0; g < ns; ++g)
+                for (int j = 0; j < sels[(size_t) g].n; ++j)
+                    for (int s = 0; s < nb; ++s)
+                        if (pblk[s] == sels[(size_t) g].blocks[j]) sel_pool[(size_t) g * nb + s] = 1;
+            int last_slot = -1, last_valid = 0;
+            for (int s = 0; s < nb; ++s) if (pblk[s] == b_last) { last_slot = s; last_valid = P % blk + 1; break; }
+            if (tprof) sp_fetch = now_ms() - sp0;
+            // relay q to this layer's pool GPU, run the pool attention there, relay the output back.
+            // Cross-device sync is host-side (consumer cards have no P2P); the decode path already
+            // syncs the host once per sparse layer for the indexer batch.
+            const size_t qbytes = (size_t) H * HD * 4;
+            cudaMemcpyAsync(ram.q_relay, dq2, qbytes, cudaMemcpyDeviceToHost, st);
+            if (cudaStreamSynchronize(st) != cudaSuccess) { err = "q D2H sync"; return false; }
+            cudaMemcpyAsync(ram.pool_q[pg], ram.q_relay, qbytes, cudaMemcpyHostToDevice, pst);
+            if (!ck("q H2D")) return false;
+            cudaMemcpyAsync(ram.dsel[pg], sel_pool.data(), (size_t) ns * nb, cudaMemcpyHostToDevice, pst);
+            if (!ck("sel H2D")) return false;
+            if (tprof) sp_relay = now_ms() - sp0;
+            m3k::k_msa_attn_pool<<<H, HD, (nb * blk * 2 + 8) * (int) sizeof(float), pst>>>(ram.pool_q[pg],
+                ram.pool_k[pg] + (size_t) pl * nb * (size_t) blk * kvn,
+                ram.pool_v[pg] + (size_t) pl * nb * (size_t) blk * kvn,
+                ram.dsel[pg], ram.pool_da[pg], H, HKV, HD, nb, blk, last_slot, last_valid);
+            if (!ck("pool launch")) return false;
+            cudaMemcpyAsync(ram.da_relay, ram.pool_da[pg], qbytes, cudaMemcpyDeviceToHost, pst);
+            if (cudaStreamSynchronize(pst) != cudaSuccess) { err = "pool attn sync"; return false; }
+            cudaSetDevice(0);
+            cudaMemcpyAsync(da, ram.da_relay, qbytes, cudaMemcpyHostToDevice, st);
+            if (!ck("da H2D")) return false;
+            if (tprof) { sp_kern = now_ms() - sp0 - sp_relay; static double a_d2h=0,a_sc=0,a_fe=0,a_re=0,a_kn=0,a_n=0; a_d2h+=sp_d2h;a_sc+=sp_score;a_fe+=sp_fetch;a_re+=sp_relay;a_kn+=sp_kern; if (++a_n == 200) { std::fprintf(stderr, "[sparse-avg ms/layer] d2h=%.2f score=%.2f fetch=%.2f relay=%.2f kern=%.2f (n=200)\n", a_d2h/a_n, a_sc/a_n, a_fe/a_n, a_re/a_n, a_kn/a_n); a_n = 0; } }
+            if (getenv("M3_DBG_ATTN") && l == 4) { std::vector<float> d((size_t) H * HD); cudaMemcpy(d.data(), da, (size_t) H * HD * 4, cudaMemcpyDeviceToHost); FILE* f = fopen("/tmp/da_4.txt", "w"); for (int i2 = 0; i2 < (int) d.size(); ++i2) fprintf(f, "%.6f\n", d[i2]); fclose(f); }
             ++sparse_idx;
-        } else {
-            m3k::k_attn<<<H, HD, 0, st>>>(dq2, lkv_k, lkv_v, da, H, HKV, HD, P + 1, ds.cap, P);
         }
+if (getenv("M3_DBG_DA") && l == 3) { std::vector<float> d((size_t) H * HD); cudaMemcpyAsync(d.data(), da, (size_t) H * HD * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); FILE* f = fopen("/tmp/da3_decode.txt", "w"); for (int i = 0; i < (int) d.size(); ++i) fprintf(f, "%.6f\n", d[i]); fclose(f); }
         if (die("attn")) return false;
         if (!mmf(L.wo, da, do_, H * HD, NE)) return false;
         m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, do_, NE);
+if (getenv("M3_DBG_XT")) { std::vector<float> d((size_t) NE); cudaMemcpyAsync(d.data(), xt, (size_t) NE * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); FILE* f = fopen((std::string("/tmp/xt_") + std::to_string(l) + "_decode.txt").c_str(), "w"); for (int i = 0; i < (int) d.size(); ++i) fprintf(f, "%.6f\n", d[i]); fclose(f); }
         if (die("add1")) return false;
         const double t_attn_end = tprof ? now_ms() : 0.0;
         // ---- FFN ----
@@ -1516,25 +1699,36 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                     auto& E = g_mg.extra[i];
                     cudaMemcpyAsync(E.h, g_mg.relay_h, (size_t) NE * sizeof(float), cudaMemcpyHostToDevice, E.st);
                     cudaMemsetAsync(E.df, 0, (size_t) NE * sizeof(float), E.st);
-                    for (int s = 0; s < r.n; ++s) {
-                        if (g_mg.gpu_of(r.experts[s], g_mg.n_gpus) != dev) continue;
-                        if (E.cache.n_slots > 0) {
-                            // this GPU's VRAM expert LRU: a hit reads the bytes from VRAM (no PCIe at all);
-                            // a miss streams them in from pinned RAM and caches them for later tokens
-                            const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
-                            int gty = 0, uty = 0, dty = 0;
-                            if (!E.cache.get(m, l, r.experts[s], E.st, &eg, &gty, &eu, &uty, &ed, &dty, err)) {
-                                err = "extra GPU vexp expert " + std::to_string(r.experts[s]) + ": " + err; cudaSetDevice(0); return false;
+                    // Grouped: fetch every assigned expert's bytes first (hits stay in VRAM, misses stream)
+                    // so all copies queue back-to-back, then one batched GEMV per projection.
+                    {
+                        const uint8_t *eg[4] = { nullptr }, *eu[4] = { nullptr }, *ed[4] = { nullptr };
+                        float wgt[4]; int gty = 0, uty = 0, dty = 0, E_cnt = 0;
+                        for (int s = 0; s < r.n; ++s) {
+                            if (g_mg.gpu_of(r.experts[s], g_mg.n_gpus) != dev) continue;
+                            if (E.cache.n_slots > 0) {
+                                if (!E.cache.get(m, l, r.experts[s], E.st, &eg[E_cnt], &gty, &eu[E_cnt], &uty, &ed[E_cnt], &dty, err)) {
+                                    err = "extra GPU vexp expert " + std::to_string(r.experts[s]) + ": " + err; cudaSetDevice(0); return false;
+                                }
+                                wgt[E_cnt] = r.weights[s]; ++E_cnt;
+                            } else if (!compute_expert(s, E.pool_g, E.pool_u, E.pool_d, E.h, E.dgate, E.dup, E.dhh, E.do_, E.df, E.st, "extra GPU expert")) {
+                                cudaSetDevice(0); return false;
                             }
-                            K::iq_mmvq_f32(gty, eg, E.h, E.dgate, NE, NFF, E.st);
-                            K::iq_mmvq_f32(uty, eu, E.h, E.dup, NE, NFF, E.st);
-                            m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, E.st>>>(E.dgate, E.dup, E.dhh, NFF);
-                            K::iq_mmvq_f32(dty, ed, E.dhh, E.do_, NFF, NE, E.st);
-                            m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, E.st>>>(E.df, E.do_, r.weights[s], NE);
+                        }
+                        if (E_cnt > 0) {
+                            void* wp[4];
+                            for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) eg[e];
+                            K::iq_mmvq_f32_batch(E_cnt, wp, gty, NE, NFF, E.h, E.dgate_b, E.st);
+                            for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) eu[e];
+                            K::iq_mmvq_f32_batch(E_cnt, wp, uty, NE, NFF, E.h, E.dup_b, E.st);
+                            for (int e = 0; e < E_cnt; ++e)
+                                m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, E.st>>>(E.dgate_b + (size_t) e * NFF, E.dup_b + (size_t) e * NFF, E.dhh_b + (size_t) e * NFF, NFF);
+                            for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) ed[e];
+                            K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, E.dhh_b, E.do_b, E.st);
+                            for (int e = 0; e < E_cnt; ++e)
+                                m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, E.st>>>(E.df, E.do_b + (size_t) e * NE, wgt[e], NE);
                             const cudaError_t ee = cudaGetLastError();
-                            if (ee != cudaSuccess) { err = "extra GPU cache GEMV: " + std::string(cudaGetErrorString(ee)); cudaSetDevice(0); return false; }
-                        } else if (!compute_expert(s, E.pool_g, E.pool_u, E.pool_d, E.h, E.dgate, E.dup, E.dhh, E.do_, E.df, E.st, "extra GPU expert")) {
-                            cudaSetDevice(0); return false;
+                            if (ee != cudaSuccess) { err = "extra GPU grouped GEMV: " + std::string(cudaGetErrorString(ee)); cudaSetDevice(0); return false; }
                         }
                     }
                     cudaMemcpyAsync(g_mg.relay_out + i * NE, E.df, (size_t) NE * sizeof(float), cudaMemcpyDeviceToHost, E.st);
@@ -1543,6 +1737,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                 cudaSetDevice(0);
                 cudaMemsetAsync(df, 0, (size_t) NE * sizeof(float), st);
                 static void* pool_g = nullptr; static void* pool_u = nullptr; static void* pool_d = nullptr;
+                static float *bg_g = nullptr, *bg_u = nullptr, *bg_h = nullptr, *bg_d = nullptr;
                 static size_t pool_sz = 0;
                 const size_t need_gu = (size_t) NFF * 4096, need_d = (size_t) NE * 4096;
                 if (pool_sz < need_gu + need_gu + need_d) {
@@ -1550,23 +1745,36 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                     pool_sz = need_gu + need_gu + need_d;
                     if (cudaMalloc(&pool_g, need_gu) != cudaSuccess || cudaMalloc(&pool_u, need_gu) != cudaSuccess ||
                         cudaMalloc(&pool_d, need_d) != cudaSuccess) { err = "expert pool"; return false; }
+                    if (cudaMalloc(&bg_g, (size_t) 4 * NFF * 4) != cudaSuccess || cudaMalloc(&bg_u, (size_t) 4 * NFF * 4) != cudaSuccess ||
+                        cudaMalloc(&bg_h, (size_t) 4 * NFF * 4) != cudaSuccess || cudaMalloc(&bg_d, (size_t) 4 * NE * 4) != cudaSuccess) { err = "expert batch pool"; return false; }
                 }
-                for (int s = 0; s < r.n; ++s) {
-                    if (g_mg.gpu_of(r.experts[s], g_mg.n_gpus) != 0) continue;
-                    if (vexp_slots > 0) {
-                        // GPU0's own share through its VRAM expert LRU (hits skip the H2D entirely)
-                        const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
-                        int gty = 0, uty = 0, dty = 0;
-                        if (!g_vexp.get(m, l, r.experts[s], st, &eg, &gty, &eu, &uty, &ed, &dty, err)) {
-                            err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
-                        }
-                        K::iq_mmvq_f32(gty, eg, dh, dgate, NE, NFF, st);
-                        K::iq_mmvq_f32(uty, eu, dh, dup, NE, NFF, st);
-                        m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                        K::iq_mmvq_f32(dty, ed, dhh, do_, NFF, NE, st);
-                        m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
-                        if (die("vexp")) return false;
-                    } else if (!compute_expert(s, pool_g, pool_u, pool_d, dh, dgate, dup, dhh, do_, df, st, "GPU0 expert")) return false;
+                // Grouped on GPU0 too: fetch all assigned experts, then batched GEMVs.
+                {
+                    const uint8_t *eg[4] = { nullptr }, *eu[4] = { nullptr }, *ed[4] = { nullptr };
+                    float wgt[4]; int gty = 0, uty = 0, dty = 0, E_cnt = 0;
+                    for (int s = 0; s < r.n; ++s) {
+                        if (g_mg.gpu_of(r.experts[s], g_mg.n_gpus) != 0) continue;
+                        if (vexp_slots > 0) {
+                            if (!g_vexp.get(m, l, r.experts[s], st, &eg[E_cnt], &gty, &eu[E_cnt], &uty, &ed[E_cnt], &dty, err)) {
+                                err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
+                            }
+                            wgt[E_cnt] = r.weights[s]; ++E_cnt;
+                        } else if (!compute_expert(s, pool_g, pool_u, pool_d, dh, dgate, dup, dhh, do_, df, st, "GPU0 expert")) return false;
+                    }
+                    if (E_cnt > 0) {
+                        void* wp[4];
+                        for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) eg[e];
+                        K::iq_mmvq_f32_batch(E_cnt, wp, gty, NE, NFF, dh, bg_g, st);
+                        for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) eu[e];
+                        K::iq_mmvq_f32_batch(E_cnt, wp, uty, NE, NFF, dh, bg_u, st);
+                        for (int e = 0; e < E_cnt; ++e)
+                            m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(bg_g + (size_t) e * NFF, bg_u + (size_t) e * NFF, bg_h + (size_t) e * NFF, NFF);
+                        for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) ed[e];
+                        K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, bg_h, bg_d, st);
+                        for (int e = 0; e < E_cnt; ++e)
+                            m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, bg_d + (size_t) e * NE, wgt[e], NE);
+                        if (die("vexp batch")) return false;
+                    }
                 }
                 // Phase C: wait for the extras, fold their partials into df
                 for (int i = 0; i < (int) g_mg.extra.size(); ++i) {
@@ -1594,21 +1802,33 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                     if (cudaMalloc(&pool_g, need_gu) != cudaSuccess || cudaMalloc(&pool_u, need_gu) != cudaSuccess ||
                         cudaMalloc(&pool_d, need_d) != cudaSuccess) { err = "expert pool"; return false; }
                 }
-                for (int s = 0; s < r.n; ++s) {
-                    if (vexp_slots > 0) {
-                        const uint8_t *eg = nullptr, *eu = nullptr, *ed = nullptr;
-                        int gty = 0, uty = 0, dty = 0;
-                        if (!g_vexp.get(m, l, r.experts[s], st, &eg, &gty, &eu, &uty, &ed, &dty, err)) {
-                            err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
-                        }
-                        K::iq_mmvq_f32(gty, eg, dh, dgate, NE, NFF, st); if (die("vexp gate")) return false;
-                        K::iq_mmvq_f32(uty, eu, dh, dup, NE, NFF, st); if (die("vexp up")) return false;
-                        m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                        K::iq_mmvq_f32(dty, ed, dhh, do_, NFF, NE, st); if (die("vexp down")) return false;
-                        m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, r.weights[s], NE);
-                        if (die("vexp")) return false;
-                    } else {
-                        if (!compute_expert(s, pool_g, pool_u, pool_d, dh, dgate, dup, dhh, do_, df, st, "expert")) return false;
+                {
+                    static float *bg_g = nullptr, *bg_u = nullptr, *bg_h = nullptr, *bg_d = nullptr;
+                    if (!bg_g && (cudaMalloc(&bg_g, (size_t) 4 * NFF * 4) != cudaSuccess || cudaMalloc(&bg_u, (size_t) 4 * NFF * 4) != cudaSuccess ||
+                                  cudaMalloc(&bg_h, (size_t) 4 * NFF * 4) != cudaSuccess || cudaMalloc(&bg_d, (size_t) 4 * NE * 4) != cudaSuccess)) { err = "expert batch pool"; return false; }
+                    const uint8_t *eg[4] = { nullptr }, *eu[4] = { nullptr }, *ed[4] = { nullptr };
+                    float wgt[4]; int gty = 0, uty = 0, dty = 0, E_cnt = 0;
+                    for (int s = 0; s < r.n; ++s) {
+                        if (vexp_slots > 0) {
+                            if (!g_vexp.get(m, l, r.experts[s], st, &eg[E_cnt], &gty, &eu[E_cnt], &uty, &ed[E_cnt], &dty, err)) {
+                                err = "vexp expert " + std::to_string(r.experts[s]) + ": " + err; return false;
+                            }
+                            wgt[E_cnt] = r.weights[s]; ++E_cnt;
+                        } else if (!compute_expert(s, pool_g, pool_u, pool_d, dh, dgate, dup, dhh, do_, df, st, "expert")) return false;
+                    }
+                    if (E_cnt > 0) {
+                        void* wp[4];
+                        for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) eg[e];
+                        K::iq_mmvq_f32_batch(E_cnt, wp, gty, NE, NFF, dh, bg_g, st); if (die("vexp batch gate")) return false;
+                        for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) eu[e];
+                        K::iq_mmvq_f32_batch(E_cnt, wp, uty, NE, NFF, dh, bg_u, st); if (die("vexp batch up")) return false;
+                        for (int e = 0; e < E_cnt; ++e)
+                            m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(bg_g + (size_t) e * NFF, bg_u + (size_t) e * NFF, bg_h + (size_t) e * NFF, NFF);
+                        for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) ed[e];
+                        K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, bg_h, bg_d, st); if (die("vexp batch down")) return false;
+                        for (int e = 0; e < E_cnt; ++e)
+                            m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, bg_d + (size_t) e * NE, wgt[e], NE);
+                        if (die("vexp batch")) return false;
                     }
                 }
             }

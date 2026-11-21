@@ -95,3 +95,13 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# agent harness dirs and local state
+.agents/
+.claude/
+ds4-slots/
+
+# local config backups and community bench runs
+strata-*.json.bak
+strata-*.json.old
+bench/results/

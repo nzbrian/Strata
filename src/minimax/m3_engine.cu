@@ -38,6 +38,9 @@ namespace K = strata::kernels;
 #include <mutex>
 #include <string>
 #include <thread>
+#include <algorithm>
+#include <random>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -67,6 +70,47 @@ double secs(const std::chrono::steady_clock::time_point& t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
+/// Next-token choice: greedy when temperature <= 0 (the engine's default), else temperature-scaled
+/// min_p -> top-k -> top-p sampling, the order the engines of this family use.  The serve protocol sends the
+/// keys on the GEN line (serve/server.py's sampling_keys), so a request that asks for sampling gets sampling
+/// and a request that does not stays greedy.
+int pick_token(const std::vector<float>& logits, double temperature, float top_p, int top_k, float min_p,
+               std::mt19937& rng) {
+    const size_t V = logits.size();
+    int best = 0;
+    for (size_t i = 1; i < V; ++i) if (logits[i] > logits[best]) best = (int) i;
+    if (!(temperature > 0.0)) return best;
+    std::vector<double> w(V);
+    const double mx = logits[best];
+    for (size_t i = 0; i < V; ++i) w[i] = std::exp((double) logits[i] - mx) / temperature;
+    if (min_p > 0.0f) {
+        const double lo = min_p * w[best];
+        for (size_t i = 0; i < V; ++i) if (w[i] < lo) w[i] = 0.0;
+    }
+    std::vector<size_t> idx(V);
+    for (size_t i = 0; i < V; ++i) idx[i] = i;
+    if (top_k > 0 && (size_t) top_k < V) {
+        std::partial_sort(idx.begin(), idx.begin() + (size_t) top_k, idx.end(),
+                          [&](size_t a, size_t b) { return w[a] > w[b]; });
+        for (size_t k = (size_t) top_k; k < V; ++k) w[idx[k]] = 0.0;
+    }
+    if (top_p < 1.0f) {
+        std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return w[a] > w[b]; });
+        double total = 0.0;
+        for (size_t i = 0; i < V; ++i) total += w[idx[i]];
+        double keep = 0.0;
+        size_t kept = 0;
+        for (size_t i = 0; i < V; ++i) {
+            keep += w[idx[i]];
+            ++kept;
+            if (keep >= top_p * total) break;
+        }
+        for (size_t i = kept; i < V; ++i) w[idx[i]] = 0.0;
+    }
+    std::discrete_distribution<int> dd(w.begin(), w.end());
+    return dd(rng);
+}
+
 /// One tensor's elements as floats. F32 needs no dequantising (can_dequant is false for it on purpose); everything
 /// else goes through the Strata quant layer.
 bool to_floats(Q::Type ty, const uint8_t* src, uint64_t n, std::vector<float>& out, std::string& err) {
@@ -83,8 +127,10 @@ struct PinnedModel {
     std::vector<void*> pinned;   // one pinned allocation per shard
     std::vector<size_t> sizes;
     bool ready = false;
+    std::mutex mu;               // stage() may be called from the serve warm-up and from a decode step
     void* shard_ptr(size_t i) const { return (ready && i < pinned.size()) ? pinned[i] : nullptr; }
     bool stage(const strata::GgufModel& g, std::string& err) {
+        std::lock_guard<std::mutex> lk(mu);
         if (ready) return true;
         const size_t n = g.size();
         pinned.resize(n, nullptr);
@@ -92,7 +138,9 @@ struct PinnedModel {
         for (size_t i = 0; i < n; ++i) {
             const size_t sz = (size_t) g.shard(i).file_size();
             sizes[i] = sz;
-            if (cudaHostAlloc(&pinned[i], sz, cudaHostAllocDefault) != cudaSuccess) {
+            // Portable: the extras (GPU1/GPU2) DMA-read this RAM for their expert caches.  Default flags
+            // register it only with the allocating device (GPU0), so the other GPUs' DMA engines read garbage.
+            if (cudaHostAlloc(&pinned[i], sz, cudaHostAllocPortable) != cudaSuccess) {
                 std::fprintf(stderr, "pinned stage  shard %zu (%zu MB): cudaHostAlloc failed, staying on the mmap\n", i, sz >> 20);
                 for (size_t j = 0; j < i; ++j) { cudaFreeHost(pinned[j]); pinned[j] = nullptr; }
                 pinned.clear(); sizes.clear();
@@ -650,11 +698,12 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
     const int nL = n_layers > 0 && n_layers < (int) m.geom.n_layers ? n_layers : (int) m.geom.n_layers;
     const int NE = m.dims.n_embd, H = m.dims.n_head, HKV = m.dims.n_head_kv, HD = m.dims.head_dim;
     const int NFF = (int) m.geom.n_ff;
+    const int NFFD = (int) m.geom.n_ff_dense;   // the dense-lead FFN is wider than the expert FFN
     // the persistent F32 expert LRU (opt-in via --experts N); idempotent, so the warm cache survives across forwards
     if (expert_cache > 0) m.init_expert_cache((size_t) expert_cache, NE, NFF);
     // the VRAM expert LRU (opt-in via --vexperts N on the quant path); 32 MB per slot covers this model's experts
     // (~13 MB) with room for the file's widest type
-    if (use_quant && vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 20u << 20)) {
+    if (use_quant && vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) {
         err = "vexp arena allocation failed"; return false;
     }
     // stage the model in pinned RAM for fast expert H2D (one-time; M3_NOSTAGE=1 disables)
@@ -686,13 +735,13 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
     auto alloc = [&](float** p, size_t n) { return cudaMalloc(p, n * sizeof(float)) == cudaSuccess; };
     if (!alloc(&dx, (size_t) T * NE) || !alloc(&dh, (size_t) NE) || !alloc(&dq, (size_t) H * HD) ||
         !alloc(&dk, (size_t) HKV * HD) || !alloc(&dv, (size_t) HKV * HD) || !alloc(&da, (size_t) H * HD) ||
-        !alloc(&do_, (size_t) NE) || !alloc(&dgate, (size_t) NFF) || !alloc(&dup, (size_t) NFF) ||
-        !alloc(&dhh, (size_t) NFF) || !alloc(&df, (size_t) NE) || !alloc(&dr, 128) ||
+        !alloc(&do_, (size_t) NE) || !alloc(&dgate, (size_t) std::max(NFF, NFFD)) || !alloc(&dup, (size_t) std::max(NFF, NFFD)) ||
+        !alloc(&dhh, (size_t) std::max(NFF, NFFD)) || !alloc(&df, (size_t) NE) || !alloc(&dr, 128) ||
         !alloc(&dout, (size_t) m.geom.n_vocab) || !alloc(&dkv_k, (size_t) HKV * (T + 8) * HD) ||
         !alloc(&dkv_v, (size_t) HKV * (T + 8) * HD) ||
         !alloc(&diq, (size_t) m.idx.n_groups * m.idx.dim) || !alloc(&dik, (size_t) m.idx.dim) ||
         !alloc(&dikc, (size_t) (T + 8) * m.idx.dim) || !alloc(&dq2, (size_t) H * HD) || !alloc(&dk2, (size_t) HKV * HD) ||
-        cudaMalloc(&dmask, (size_t) (T + 8)) != cudaSuccess) { err = "cudaMalloc"; return false; }
+        cudaMalloc(&dmask, (size_t) m.idx.n_groups * (T + 8)) != cudaSuccess) { err = "cudaMalloc"; return false; }
     // Q8_1 scratch (one row of NE and one of NFF)
     // hq8 holds the Q8_1 of the largest projection input: the q-k-v use NE, the output uses H*HD (larger)
     size_t q8ne = K::native_q8_1_bytes((std::max)(NE, H * HD), 1), q8nff = K::native_q8_1_bytes(NFF, 1);
@@ -761,11 +810,18 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
     };
     // a projection GEMM: F32 weight -> the plain F32 matvec; quantised weight -> iq_mmvq_f32 on the FLOAT
     // activation (iq_mmvq's Q8_1 activation is not accurate over 60 MoE layers - it compounds to the wrong token)
+    // M3_Q81=1: test the Q8_1-activation path (the original design) against the float-activation default
+    static const bool m3_q81 = getenv("M3_Q81") != nullptr;
     auto mmf = [&](WProj& w, const float* f32a, void* q81a, float* y, int n_in, int n_out) -> bool {
-        (void) q81a;
         if (w.type == (int64_t) Q::Type::F32) {
             m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
             return !die("mmf");
+        }
+        if (m3_q81) {
+            try { K::native_quantize_q8_1(f32a, q81a, n_in, 1, st); }
+            catch (const std::exception& e) { err = std::string("quant81: ") + e.what(); return false; }
+            K::iq_mmvq((int) w.type, w.d, q81a, y, n_in, n_out, 1, st);
+            return !die("mmf q81");
         }
         K::iq_mmvq_f32((int) w.type, w.d, f32a, y, n_in, n_out, st);
         return !die("mmf");
@@ -837,15 +893,15 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                 cudaMemcpyAsync(ikc.data(), dikc, (size_t) npos * m.idx.dim * sizeof(float), cudaMemcpyDeviceToHost, st);
                 cudaMemcpyAsync(diqh.data(), diq, diqh.size() * sizeof(float), cudaMemcpyDeviceToHost, st);
                 cudaStreamSynchronize(st);
-                std::vector<unsigned char> mask(npos, 0);
+                std::vector<unsigned char> mask((size_t) m.idx.n_groups * npos, 0);   // per GQA group, NOT the union
                 std::vector<float> scores((size_t) nblk);
                 for (int g = 0; g < m.idx.n_groups; ++g) {
                     mm::block_scores(diqh.data() + (size_t) g * m.idx.dim, ikc.data(), nullptr, npos, m.idx.dim, m.idx.blk, t, m.idx.local, scores.data());
                     const mm::BlockSel sel = mm::select_blocks(scores.data(), nblk, m.idx.topk);
                     for (int j = 0; j < sel.n; ++j)
-                        for (int pp = sel.blocks[j] * m.idx.blk; pp < (sel.blocks[j] + 1) * m.idx.blk && pp < npos; ++pp) mask[pp] = 1;
+                        for (int pp = sel.blocks[j] * m.idx.blk; pp < (sel.blocks[j] + 1) * m.idx.blk && pp < npos; ++pp) mask[(size_t) g * npos + pp] = 1;
                 }
-                cudaMemcpyAsync(dmask, mask.data(), (size_t) npos, cudaMemcpyHostToDevice, st);
+                cudaMemcpyAsync(dmask, mask.data(), (size_t) m.idx.n_groups * npos, cudaMemcpyHostToDevice, st);
                 m3k::k_msa_attn<<<H, HD, 0, st>>>(dq2, dkv_k, dkv_v, dmask, da, H, HKV, HD, npos, cap);
             } else {
                 m3k::k_attn<<<H, HD, 0, st>>>(dq2, dkv_k, dkv_v, da, H, HKV, HD, t + 1, cap, t);
@@ -867,10 +923,10 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                 float* xt = dx + (size_t) t * NE;
                 dim3 gr((NE + 1023) / 1024, 1);
                 m3k::k_rms<<<gr, 1024, 0, st>>>(xt, fn, dh, NE, (float) m.geom.rms_eps);
-                    if (!mmf(dg, dh, hq8, dgate, NE, NFF)) return false;
-                if (!mmf(du, dh, hq8, dup, NE, NFF)) return false;
-                m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-                if (!mmf(dd, dhh, hh8, df, NFF, NE)) return false;
+                    if (!mmf(dg, dh, hq8, dgate, NE, NFFD)) return false;
+                if (!mmf(du, dh, hq8, dup, NE, NFFD)) return false;
+                m3k::k_swiglu_oai<<<(NFFD + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFFD);
+                if (!mmf(dd, dhh, hh8, df, NFFD, NE)) return false;
                 m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
                 if (die("dense_ffn")) return false;
             }
@@ -1091,7 +1147,7 @@ bool m3_multigpu_init(int NE, int NFF, bool use_quant, int n_gpus, int expslots,
         // this GPU's expert LRU: the extra GPUs hold no resident weights, so most of their VRAM is cache.
         // 20 MB per slot fits this model's largest expert (16.4 MB, IQ2_XS gate/up/down) without the 2.4x
         // waste of a 32 MB slot, so the same VRAM holds ~60% more cached instances.
-        if (!E.cache.init((size_t) expslots, 20u << 20, dev)) {
+        if (!E.cache.init((size_t) expslots, 32u << 20, dev)) {
             err = "extra GPU expert cache (device " + std::to_string(dev) + ")"; return false;
         }
     }
@@ -1130,10 +1186,26 @@ struct M3DecodeState {
     float* didxc = nullptr;                      // [n_sparse][cap][idx.dim]
     float* d_part = nullptr;                     // multi-GPU: one extra GPU's partial output (NE floats, GPU0)
     int cap = 0, n_pos = 0;
-    int NE = 0, n_head = 0, HKV = 0, HD = 0, NFF = 0, nL = 0, dense_lead = 0, n_sparse = 0;
+    int NE = 0, n_head = 0, HKV = 0, HD = 0, NFF = 0, NFFD = 0, nL = 0, dense_lead = 0, n_sparse = 0;
     int idx_dim = 0, idx_groups = 0, idx_blk = 0, idx_topk = 0, idx_local = 0;
+    // Step scratch, allocated ONCE at init (not per step).  A per-step cudaFree is a whole-device synchronous
+    // drain, so reading a 198-token prompt used to do ~198x18 implicit drains that destroyed the async overlap
+    // of the three GPUs' expert streams.  The persistent stream keeps ordering (FIFO) with no per-step sync; the
+    // cross-GPU relay handoffs carry their own explicit cudaStreamSynchronize calls.
+    struct Scratch {
+        float *dx=nullptr, *dh=nullptr, *dq=nullptr, *dk=nullptr, *dv=nullptr, *da=nullptr, *do_=nullptr,
+              *dgate=nullptr, *dup=nullptr, *dhh=nullptr, *df=nullptr, *dout=nullptr,
+              *diq=nullptr, *dik=nullptr, *dq2=nullptr, *dk2=nullptr;
+        unsigned char* dmask=nullptr;
+        int32_t* dtok=nullptr;
+        cudaStream_t st=nullptr;
+    } scratch;
     bool ready = false;
 };
+// One per process: initialised at startup (before READY) in serve mode, so "ready" means ready to serve
+// immediately and the first request does not block on the one-time model staging (which would trip the
+// request's silence watchdog).
+static M3DecodeState g_ds;
 
 void m3_decode_free(M3DecodeState& ds) {
     for (auto& L : ds.layers) {
@@ -1150,6 +1222,16 @@ void m3_decode_free(M3DecodeState& ds) {
     if (ds.dkv_v) { cudaFree(ds.dkv_v); ds.dkv_v = nullptr; }
     if (ds.didxc) { cudaFree(ds.didxc); ds.didxc = nullptr; }
     if (ds.d_part) { cudaFree(ds.d_part); ds.d_part = nullptr; }
+    {
+        auto& S = ds.scratch;
+        cudaFree(S.dx); cudaFree(S.dh); cudaFree(S.dq); cudaFree(S.dk); cudaFree(S.dv); cudaFree(S.da);
+        cudaFree(S.do_); cudaFree(S.dgate); cudaFree(S.dup); cudaFree(S.dhh); cudaFree(S.df); cudaFree(S.dout);
+        cudaFree(S.diq); cudaFree(S.dik); cudaFree(S.dq2); cudaFree(S.dk2); cudaFree(S.dmask); cudaFree(S.dtok);
+        if (S.st) { cudaStreamDestroy(S.st); S.st = nullptr; }
+        S.dx = S.dh = S.dq = S.dk = S.dv = S.da = S.do_ = nullptr;
+        S.dgate = S.dup = S.dhh = S.df = S.dout = S.diq = S.dik = S.dq2 = S.dk2 = nullptr;
+        S.dmask = nullptr; S.dtok = nullptr;
+    }
     ds.n_pos = 0; ds.ready = false;
 }
 
@@ -1169,8 +1251,9 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
     }
     const int NE = m.dims.n_embd, H = m.dims.n_head, HKV = m.dims.n_head_kv, HD = m.dims.head_dim;
     const int NFF = (int) m.geom.n_ff;
+    const int NFFD = (int) m.geom.n_ff_dense;   // the dense-lead FFN is wider than the expert FFN
     const int nL = (int) m.geom.n_layers;
-    ds.NE = NE; ds.n_head = H; ds.HKV = HKV; ds.HD = HD; ds.NFF = NFF; ds.nL = nL;
+    ds.NE = NE; ds.n_head = H; ds.HKV = HKV; ds.HD = HD; ds.NFF = NFF; ds.NFFD = NFFD; ds.nL = nL;
     ds.dense_lead = (int) m.geom.n_dense_lead;
     ds.n_sparse = nL - ds.dense_lead;
     ds.cap = cap; ds.n_pos = 0;
@@ -1252,6 +1335,19 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
         cudaMalloc(&ds.d_part, (size_t) NE * sizeof(float)) != cudaSuccess) {
         err = "KV cache allocation"; return false;
     }
+    {
+        auto& S = ds.scratch;
+        auto A = [&](float** p, size_t n) { return cudaMalloc(p, n * sizeof(float)) == cudaSuccess; };
+        if (!A(&S.dx, NE) || !A(&S.dh, NE) || !A(&S.dq, (size_t) H * HD) || !A(&S.dk, (size_t) HKV * HD) ||
+            !A(&S.dv, (size_t) HKV * HD) || !A(&S.da, (size_t) H * HD) || !A(&S.do_, NE) ||
+            !A(&S.dgate, (size_t) std::max(NFF, NFFD)) || !A(&S.dup, (size_t) std::max(NFF, NFFD)) ||
+            !A(&S.dhh, (size_t) std::max(NFF, NFFD)) || !A(&S.df, NE) ||
+            !A(&S.dout, (size_t) m.geom.n_vocab) || !A(&S.diq, (size_t) m.idx.n_groups * m.idx.dim) ||
+            !A(&S.dik, m.idx.dim) || !A(&S.dq2, (size_t) H * HD) || !A(&S.dk2, (size_t) HKV * HD) ||
+            cudaMalloc(&S.dmask, (size_t) m.idx.n_groups * cap) != cudaSuccess ||
+            cudaMalloc(&S.dtok, sizeof(int32_t)) != cudaSuccess) { err = "decode scratch"; return false; }
+        if (cudaStreamCreate(&S.st) != cudaSuccess) { err = "decode stream"; return false; }
+    }
     ds.ready = true;
     return true;
 }
@@ -1259,30 +1355,25 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
 // One decode step: process `token_id` at position ds.n_pos, attending to 0..P from the persistent cache,
 // appending its k/v, and returning the next-token logits. Advances ds.n_pos by one on success.
 bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
-                    std::vector<float>& logits, std::string& err) {
+                    std::vector<float>& logits, std::string& err, bool prefill_only = false) {
     if (!ds.ready) { err = "decode state not initialised"; return false; }
-    const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD, NFF = ds.NFF;
+    const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD, NFF = ds.NFF, NFFD = ds.NFFD;
     const int P = ds.n_pos;
     if (P >= ds.cap) { err = "context length exceeded (" + std::to_string(P) + ")"; return false; }
-    if (vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 20u << 20)) { err = "vexp arena"; return false; }
+    if (vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) { err = "vexp arena"; return false; }
 
-    cudaStream_t st;
-    if (cudaStreamCreate(&st) != cudaSuccess) { err = "cudaStreamCreate"; return false; }
+    // persistent step scratch (allocated once in m3_decode_init): no per-step cudaMalloc/cudaFree, so no
+    // per-step whole-device drain.  The router D2H already syncs the stream once per step, and the stream's
+    // FIFO ordering keeps the reused buffers correct across steps.
+    auto& SC = ds.scratch;
+    cudaStream_t st = SC.st;
     auto die = [&](const char* w) -> bool { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; } return false; };
 
-    float *dx=nullptr,*dh=nullptr,*dq=nullptr,*dk=nullptr,*dv=nullptr,*da=nullptr,*do_=nullptr,
-          *dgate=nullptr,*dup=nullptr,*dhh=nullptr,*df=nullptr,*dout=nullptr,
-          *diq=nullptr,*dik=nullptr,*dq2=nullptr,*dk2=nullptr;
-    unsigned char* dmask=nullptr;
-    auto alloc = [&](float** p, size_t n) { return cudaMalloc(p, n * sizeof(float)) == cudaSuccess; };
-    if (!alloc(&dx, NE) || !alloc(&dh, NE) || !alloc(&dq, (size_t) H*HD) || !alloc(&dk, (size_t) HKV*HD) ||
-        !alloc(&dv, (size_t) HKV*HD) || !alloc(&da, (size_t) H*HD) || !alloc(&do_, NE) ||
-        !alloc(&dgate, NFF) || !alloc(&dup, NFF) || !alloc(&dhh, NFF) || !alloc(&df, NE) ||
-        !alloc(&dout, (size_t) m.geom.n_vocab) || !alloc(&diq, (size_t) m.idx.n_groups * m.idx.dim) ||
-        !alloc(&dik, m.idx.dim) || !alloc(&dq2, (size_t) H*HD) || !alloc(&dk2, (size_t) HKV*HD) ||
-        cudaMalloc(&dmask, (size_t) ds.cap) != cudaSuccess) { err = "decode scratch"; return false; }
-    int32_t* dtok = nullptr;
-    cudaMalloc(&dtok, sizeof(int32_t));
+    float *dx=SC.dx, *dh=SC.dh, *dq=SC.dq, *dk=SC.dk, *dv=SC.dv, *da=SC.da, *do_=SC.do_,
+          *dgate=SC.dgate, *dup=SC.dup, *dhh=SC.dhh, *df=SC.df, *dout=SC.dout,
+          *diq=SC.diq, *dik=SC.dik, *dq2=SC.dq2, *dk2=SC.dk2;
+    unsigned char* dmask=SC.dmask;
+    int32_t* dtok=SC.dtok;
     cudaMemcpyAsync(dtok, &token_id, sizeof(int32_t), cudaMemcpyHostToDevice, st);
     K::iq_embed_rows((int) ds.etype, ds.detab, ds.erow, dtok, 1, NE, dx, st); if (die("embed")) return false;
 
@@ -1343,15 +1434,15 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             cudaMemcpyAsync(ikc.data(), lidxc, (size_t) npos * m.idx.dim * sizeof(float), cudaMemcpyDeviceToHost, st);
             cudaMemcpyAsync(diqh.data(), diq, diqh.size() * sizeof(float), cudaMemcpyDeviceToHost, st);
             cudaStreamSynchronize(st);
-            std::vector<unsigned char> mask(npos, 0);
+            std::vector<unsigned char> mask((size_t) m.idx.n_groups * npos, 0);   // per GQA group, NOT the union
             std::vector<float> bscore((size_t) nblk);
             for (int g = 0; g < m.idx.n_groups; ++g) {
                 mm::block_scores(diqh.data() + (size_t) g * m.idx.dim, ikc.data(), nullptr, npos, m.idx.dim, m.idx.blk, P, m.idx.local, bscore.data());
                 const mm::BlockSel sel = mm::select_blocks(bscore.data(), nblk, m.idx.topk);
                 for (int j = 0; j < sel.n; ++j)
-                    for (int pp = sel.blocks[j] * m.idx.blk; pp < (sel.blocks[j] + 1) * m.idx.blk && pp < npos; ++pp) mask[pp] = 1;
+                    for (int pp = sel.blocks[j] * m.idx.blk; pp < (sel.blocks[j] + 1) * m.idx.blk && pp < npos; ++pp) mask[(size_t) g * npos + pp] = 1;
             }
-            cudaMemcpyAsync(dmask, mask.data(), (size_t) npos, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(dmask, mask.data(), (size_t) m.idx.n_groups * npos, cudaMemcpyHostToDevice, st);
             m3k::k_msa_attn<<<H, HD, 0, st>>>(dq2, lkv_k, lkv_v, dmask, da, H, HKV, HD, npos, ds.cap);
             ++sparse_idx;
         } else {
@@ -1365,10 +1456,10 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
         // ---- FFN ----
         if (!sparse) {
             m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.fn, dh, NE, (float) m.geom.rms_eps);
-            if (!mmf(L.dg, dh, dgate, NE, NFF)) return false;
-            if (!mmf(L.du, dh, dup, NE, NFF)) return false;
-            m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFF);
-            if (!mmf(L.dd, dhh, df, NFF, NE)) return false;
+            if (!mmf(L.dg, dh, dgate, NE, NFFD)) return false;
+            if (!mmf(L.du, dh, dup, NE, NFFD)) return false;
+            m3k::k_swiglu_oai<<<(NFFD + 1023) / 1024, 1024, 0, st>>>(dgate, dup, dhh, NFFD);
+            if (!mmf(L.dd, dhh, df, NFFD, NE)) return false;
             m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
             if (die("dense_ffn")) return false;
         } else {
@@ -1549,6 +1640,12 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
         std::fflush(stderr);
     }
     ds.n_pos = P + 1;
+    if (prefill_only) {
+        // a non-final prompt token: the KV is appended and no logits are needed, so skip the final norm + the
+        // 200064-vocab head GEMV (the biggest per-prompt-token cost after the experts).  The router's D2H
+        // already synced the stream this step, and the stream's FIFO order keeps the reused scratch correct.
+        return true;
+    }
     const double t_head0 = tprof ? now_ms() : 0.0;
     // ---- final norm + head ----
     m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(dx, ds.out_norm, dh, NE, (float) m.geom.rms_eps);
@@ -1558,11 +1655,7 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
     cudaStreamSynchronize(st);
     if (die("head copy")) return false;
     if (tprof) std::fprintf(stderr, "[tprof] head+logits=%.1fms (total step so far: see attn/ffn above)\n", now_ms() - t_head0);
-    // free step scratch
-    cudaFree(dx); cudaFree(dh); cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(da); cudaFree(do_);
-    cudaFree(dgate); cudaFree(dup); cudaFree(dhh); cudaFree(df); cudaFree(dout);
-    cudaFree(diq); cudaFree(dik); cudaFree(dq2); cudaFree(dk2); cudaFree(dmask); cudaFree(dtok);
-    cudaStreamDestroy(st);
+    // scratch is persistent (freed once in m3_decode_free): no per-step cudaFree / cudaStreamDestroy
     return true;
 }
 
@@ -1658,6 +1751,19 @@ int run(int argc, char** argv) {
 
     // --serve: serve/server.py's engine protocol. READY announces the context; GEN <max> [k=v] <ids> runs a prompt
     // and streams the generated ids as T lines, then a DONE line; STOP ends it.
+    // Load everything BEFORE announcing ready: upload the resident weights to the GPUs and stage the model in
+    // pinned RAM (~112 GB, a few minutes).  The server waits up to 900 s for READY, so this is startup, not a
+    // request - doing it on the first request instead would trip that request's 300 s silence watchdog.
+    if (serve && use_gpu && use_quant) {
+        std::string derr;
+        const auto ts = std::chrono::steady_clock::now();
+        if (!m3_decode_init(m, g_ds, true, ctx, n_gpus, expslots, derr)) {
+            std::fprintf(stderr, "decode init failed: %s\n", derr.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "m3 decode     weights resident + model staged in %.1f s; ready to serve\n", secs(ts));
+        std::fflush(stderr);
+    }
     std::printf("READY %d stop\n", ctx);
     std::fflush(stdout);
     std::atomic<bool> stop{false};
@@ -1689,18 +1795,43 @@ int run(int argc, char** argv) {
             else if (eof) return 0;
         }
         if (!have) continue;
-        if (line.rfind("GEN", 0) != 0) { std::printf("ERR expected: GEN <max> <id,id,...>\n"); std::fflush(stdout); continue; }
-        // GEN <max_new> <id,id,...>
-        size_t sp = line.find(' ');
-        if (sp == std::string::npos) continue;
-        const int max_new = std::atoi(line.c_str() + sp + 1);
-        size_t idsp = line.find(' ', sp + 1);
-        if (idsp == std::string::npos) continue;
+        if (line.rfind("GEN", 0) != 0) { std::printf("ERR expected: GEN <max> [k=v] <id,id,...>\n"); std::fflush(stdout); continue; }
+        // GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N] <id,id,...>: the serve protocol rides
+        // per-request sampling on the same line (serve/server.py's sampling_keys).  Unknown keys are accepted
+        // and ignored (no penalty pass yet); no temperature means greedy, as always.
+        std::vector<std::string> fields;
+        {
+            std::istringstream ls(line);
+            std::string ft;
+            while (std::getline(ls, ft, ' ')) if (!ft.empty()) fields.push_back(ft);
+        }
+        if (fields.size() < 2) continue;
+        // fields[0] is the literal "GEN"; fields[1] is max_new; fields[2..] are the sampling keys and the id list
+        const int max_new = std::atoi(fields[1].c_str());
+        double temperature = 0.0;
+        float top_p = 1.0f;
+        int top_k = 0;
+        float min_p = 0.0f;
+        static std::mt19937 rng{std::random_device{}()};
+        std::string ids_field;
+        for (size_t fi = 2; fi < fields.size(); ++fi) {
+            const std::string& f = fields[fi];
+            const size_t eq = f.find('=');
+            if (eq == std::string::npos) { ids_field = f; continue; }   // the comma-separated id list has no '='
+            const std::string key = f.substr(0, eq);
+            const double val = std::atof(f.c_str() + eq + 1);
+            if (key == "temperature") temperature = val;
+            else if (key == "top_p") top_p = (float) val;
+            else if (key == "top_k") top_k = (int) val;
+            else if (key == "min_p") min_p = (float) val;
+            else if (key == "seed") rng.seed((unsigned) val);
+        }
+        if (ids_field.empty()) continue;
         std::vector<int> ids;
-        size_t p = idsp + 1;
-        while (p <= line.size()) {
-            const size_t c = line.find(',', p);
-            const std::string s = line.substr(p, c == std::string::npos ? std::string::npos : c - p);
+        size_t p = 0;
+        while (p <= ids_field.size()) {
+            const size_t c = ids_field.find(',', p);
+            const std::string s = ids_field.substr(p, c == std::string::npos ? std::string::npos : c - p);
             if (!s.empty()) ids.push_back(std::atoi(s.c_str()));
             if (c == std::string::npos) break;
             p = c + 1;
@@ -1709,13 +1840,15 @@ int run(int argc, char** argv) {
         std::vector<int> produced;
         if (use_gpu && use_quant) {
             // the decode engine: resident weights + a persistent KV cache, one step per token (no prefix
-            // recomputation, no per-token weight re-upload)
-            static M3DecodeState ds;
-            if (!ds.ready && !m3_decode_init(m, ds, true, ctx, n_gpus, expslots, err)) {
+            // recomputation, no per-token weight re-upload).  g_ds is initialised at startup (before READY);
+            // the fallback covers a serve start that skipped it.
+            if (!g_ds.ready && !m3_decode_init(m, g_ds, true, ctx, n_gpus, expslots, err)) {
                 std::printf("ERR decode init (try a smaller --ctx): %s\n", err.c_str()); std::fflush(stdout); continue;
             }
+            M3DecodeState& ds = g_ds;
             ds.n_pos = 0;   // a new conversation per GEN
             const bool trace = getenv("M3_TRACE") != nullptr;
+            const bool dbg = getenv("M3_DBG") != nullptr;   // M3_DBG=1: step-level tracing to stderr (the engine log)
             static int trace_seq = 0;
             auto tstamp = [&]() {
                 const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1724,10 +1857,28 @@ int run(int argc, char** argv) {
             };
             std::vector<float> logits;
             bool ok = true;
+            const auto prompt_t0 = std::chrono::steady_clock::now();
+            if (dbg) { std::fprintf(stderr, "[dbg] GEN start: prompt=%zu ids, max_new=%d temperature=%f top_p=%f top_k=%d\n",
+                                    ids.size(), max_new, temperature, (double) top_p, top_k); std::fflush(stderr); }
             for (size_t i = 0; i < ids.size(); ++i) {
                 if (trace) { tstamp(); ++trace_seq; }
-                if (!m3_decode_step(m, ds, vexp_slots, ids[i], logits, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); ok = false; break; }
+                if (dbg && (i == 0 || (i + 1) % 32 == 0 || i + 1 == ids.size()))
+                    { std::fprintf(stderr, "[dbg] prompt step %zu/%zu begin (P=%d)\n", i + 1, ids.size(), ds.n_pos); std::fflush(stderr); }
+                // prefill: skip the final norm + 200k-vocab head for every prompt token but the last (only the
+                // last needs logits for the first generated token)
+                const bool last_prompt = (i + 1 == ids.size());
+                if (!m3_decode_step(m, ds, vexp_slots, ids[i], logits, err, !last_prompt)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); ok = false; break; }
+                if (dbg && (i == 0 || (i + 1) % 32 == 0 || i + 1 == ids.size()))
+                    { std::fprintf(stderr, "[dbg] prompt step %zu/%zu done (P=%d)\n", i + 1, ids.size(), ds.n_pos); std::fflush(stderr); }
+                // prompt progress (serve/server.py's PP line): the decode engine reads the prompt one token at a
+                // time with no T lines until generation starts, so without this the server's silence watchdog
+                // would end the engine mid-prompt on a long prompt.  Every PP line resets that timer.
+                const long prompt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - prompt_t0).count();
+                std::printf("PP %zu %zu %ld\n", i + 1, ids.size(), prompt_ms);
+                std::fflush(stdout);
             }
+            if (dbg) { std::fprintf(stderr, "[dbg] prompt done (P=%d), starting generation\n", ds.n_pos); std::fflush(stderr); }
             // the prompt's routing is free data about which experts generation will want: re-point the expert
             // cache at the hottest ones (LFU refresh) before the first generated token
             if (ok && vexp_slots > 0) {
@@ -1740,23 +1891,26 @@ int run(int argc, char** argv) {
             }
             if (ok) {
                 for (int g = 0; g < max_new; ++g) {
-                    int best = 0;
-                    for (size_t i = 1; i < logits.size(); ++i) if (logits[i] > logits[best]) best = (int) i;
+                    if (dbg) { std::fprintf(stderr, "[dbg] gen step %d: pick_token begin (P=%d)\n", g, ds.n_pos); std::fflush(stderr); }
+                    const int best = pick_token(logits, temperature, top_p, top_k, min_p, rng);
+                    if (dbg) { std::fprintf(stderr, "[dbg] gen step %d: picked %d, emitting T line\n", g, best); std::fflush(stderr); }
                     produced.push_back(best);
                     std::printf("T %d\n", best);
                     std::fflush(stdout);
                     if (g + 1 < max_new) {
                         if (trace) { tstamp(); ++trace_seq; }
+                        if (dbg) { std::fprintf(stderr, "[dbg] gen step %d: decode_step begin for token %d\n", g, best); std::fflush(stderr); }
                         if (!m3_decode_step(m, ds, vexp_slots, best, logits, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
+                        if (dbg) { std::fprintf(stderr, "[dbg] gen step %d: decode_step done (P=%d)\n", g, ds.n_pos); std::fflush(stderr); }
                     }
                 }
+                if (dbg) { std::fprintf(stderr, "[dbg] generation done: %zu tokens, emitting DONE\n", produced.size()); std::fflush(stderr); }
             }
         } else {
             for (int g = 0; g < max_new; ++g) {
                 std::vector<float> logits;
                 if (!(use_gpu ? forward_gpu(m, ids, 0, use_quant, expert_cache, vexp_slots, logits, err) : forward(m, ids, 0, logits, err))) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); break; }
-                int best = 0;
-                for (size_t i = 1; i < logits.size(); ++i) if (logits[i] > logits[best]) best = (int) i;
+                const int best = pick_token(logits, temperature, top_p, top_k, min_p, rng);
                 produced.push_back(best);
                 std::printf("T %d\n", best);
                 std::fflush(stdout);

@@ -108,8 +108,10 @@ __global__ void k_scale(float* __restrict__ x, float s, int n) {
 }
 
 /// MSA attention: GQA over an irregular set of visible positions (the indexer's selected blocks), one query row
-/// (H heads). `vis` is npos bytes, 1 on a position to read. One thread per output element, an online softmax in
-/// double - the same order of operations as strata::minimax::attn_one with a sparse mask, so it matches the CPU.
+/// (H heads). `vis` is HKV*npos bytes: `vis[hkv*npos+p]` is 1 when GQA group `hkv` may read position `p`.  Each
+/// group reads only its OWN indexer head's selected blocks (llama.cpp gathers `tr = cell*HKV + h`), NOT the union,
+/// so one shared mask would attend 4x too many keys and corrupt longer prompts.  One thread per output element,
+/// an online softmax in double.
 __global__ void k_msa_attn(const float* __restrict__ q, const float* __restrict__ kv, const float* __restrict__ vv,
                            const unsigned char* __restrict__ vis, float* __restrict__ out,
                            int H, int HKV, int HD, int npos, int cap) {
@@ -122,7 +124,7 @@ __global__ void k_msa_attn(const float* __restrict__ q, const float* __restrict_
     const float scale = rsqrtf((float) HD);
     double m = -1e300, l = 0.0, acc = 0.0;
     for (int p = 0; p < npos; ++p) {
-        if (!vis[p]) continue;
+        if (!vis[(size_t) hkv * npos + p]) continue;
         const float* kp = kh + (size_t) p * HD;
         double s = 0.0;
         for (int j = 0; j < HD; ++j) s += (double) qh[j] * kp[j];

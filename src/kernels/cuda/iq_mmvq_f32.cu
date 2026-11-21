@@ -130,6 +130,109 @@ __device__ __forceinline__ void dq_q6_K_one(const block_q6_K* x, float* y) {
     }
 }
 
+__device__ __forceinline__ void dq_iq3_xxs_one(const block_iq3_xxs* x, float* y) {
+    const float d = fp16_to_fp32(x->d);
+    const uint8_t* qs = x->qs;
+    const uint8_t* sas = qs + QK_K / 4;   // the last 32 bytes carry scales and sign indices
+#pragma unroll
+    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            // byte assembly: the 98-byte block stride leaves sas unaligned for a uint32 load
+            const uint8_t* sb = sas + 4 * ib32;
+            const uint32_t aux32 = (uint32_t) sb[0] | ((uint32_t) sb[1] << 8) | ((uint32_t) sb[2] << 16) | ((uint32_t) sb[3] << 24);
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t signs = dev_ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+            const int8_t* g1 = (const int8_t*) (dev_iq3xxs_grid + qs[2 * l + 0]);
+            const int8_t* g2 = (const int8_t*) (dev_iq3xxs_grid + qs[2 * l + 1]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                y[ib32 * 32 + l * 8 + j + 0] = db * g1[j] * (signs & dev_kmask_iq2xs[j + 0] ? -1.f : 1.f);
+                y[ib32 * 32 + l * 8 + j + 4] = db * g2[j] * (signs & dev_kmask_iq2xs[j + 4] ? -1.f : 1.f);
+            }
+        }
+        qs += 8;
+    }
+}
+
+__device__ __forceinline__ void dq_iq4_xs_one(const block_iq4_xs* x, float* y) {
+    const float d = fp16_to_fp32(x->d);
+    const uint8_t* qs = x->qs;
+#pragma unroll
+    for (int ib = 0; ib < QK_K / 32; ++ib) {
+        const int ls = ((x->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4);
+        const float dl = d * (ls - 32);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            y[ib * 32 + j + 0] = dl * dev_kvalues_iq4nl[qs[j] & 0xf];
+            y[ib * 32 + j + 16] = dl * dev_kvalues_iq4nl[qs[j] >> 4];
+        }
+        qs += 16;
+    }
+}
+
+__device__ __forceinline__ void dq_q2_K_one(const block_q2_K* x, float* y) {
+    const float d = fp16_to_fp32(x->d);
+    const float mn = fp16_to_fp32(x->dmin);
+    const uint8_t* q = x->qs;
+    int is = 0;
+#pragma unroll
+    for (int n = 0; n < QK_K; n += 128) {
+        int shift = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t sc = x->scales[is++];
+            const float dl = d * (sc & 0xF), ml = mn * (sc >> 4);
+#pragma unroll
+            for (int l = 0; l < 16; ++l) y[n + l] = dl * ((int8_t) ((q[l] >> shift) & 3)) - ml;
+            const uint8_t sc2 = x->scales[is++];
+            const float dl2 = d * (sc2 & 0xF), ml2 = mn * (sc2 >> 4);
+#pragma unroll
+            for (int l = 0; l < 16; ++l) y[n + 16 + l] = dl2 * ((int8_t) ((q[l + 16] >> shift) & 3)) - ml2;
+            shift += 2;
+        }
+        q += 32;
+    }
+}
+
+__device__ __forceinline__ void dq_q3_K_one(const block_q3_K* x, float* y) {
+    const float d = fp16_to_fp32(x->d);
+    const uint8_t* q = x->qs;
+    const uint8_t* hm = x->hmask;
+    uint32_t aux[4];
+    const int8_t* scales = (const int8_t*) aux;
+    {
+        const uint8_t* sb = x->scales;
+        aux[0] = (uint32_t) sb[0] | ((uint32_t) sb[1] << 8) | ((uint32_t) sb[2] << 16) | ((uint32_t) sb[3] << 24);
+        aux[1] = (uint32_t) sb[4] | ((uint32_t) sb[5] << 8) | ((uint32_t) sb[6] << 16) | ((uint32_t) sb[7] << 24);
+        aux[2] = (uint32_t) sb[8] | ((uint32_t) sb[9] << 8) | ((uint32_t) sb[10] << 16) | ((uint32_t) sb[11] << 24);
+    }
+    const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    int is = 0;
+    uint8_t m = 1;
+#pragma unroll
+    for (int n = 0; n < QK_K; n += 128) {
+        int shift = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float dl = d * (scales[is++] - 32);
+#pragma unroll
+            for (int l = 0; l < 16; ++l) y[n + l] = dl * ((int8_t) ((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+            const float dl2 = d * (scales[is++] - 32);
+#pragma unroll
+            for (int l = 0; l < 16; ++l) y[n + 16 + l] = dl2 * ((int8_t) ((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+            shift += 2;
+            m <<= 1;
+        }
+        q += 32;
+    }
+}
+
 __device__ __forceinline__ void dq_iq2_xxs_one(const block_iq2_xxs* x, float* y) {
     const float d = fp16_to_fp32(x->d);
     uint32_t aux32[2];
@@ -217,11 +320,15 @@ __device__ __forceinline__ void dq_iq2_xs_one(const block_iq2_xs* x, float* y) {
 __device__ int dequant_block(int type, const uint8_t* wrow, int bi, float* sw) {
     switch (type) {
         case 8:  { const auto* b = (const block_q8_0*)    wrow; dq_q8_0_one   (&b[bi], sw + bi * QK8_0); return QK8_0; }
+        case 10: { const auto* b = (const block_q2_K*)    wrow; dq_q2_K_one   (&b[bi], sw + bi * QK_K);  return QK_K;  }
+        case 11: { const auto* b = (const block_q3_K*)    wrow; dq_q3_K_one   (&b[bi], sw + bi * QK_K);  return QK_K;  }
         case 12: { const auto* b = (const block_q4_K*)    wrow; dq_q4_K_one   (&b[bi], sw + bi * QK_K);  return QK_K;  }
         case 13: { const auto* b = (const block_q5_K*)    wrow; dq_q5_K_one   (&b[bi], sw + bi * QK_K);  return QK_K;  }
         case 14: { const auto* b = (const block_q6_K*)    wrow; dq_q6_K_one   (&b[bi], sw + bi * QK_K);  return QK_K;  }
         case 16: { const auto* b = (const block_iq2_xxs*) wrow; dq_iq2_xxs_one(&b[bi], sw + bi * QK_K);  return QK_K;  }
         case 17: { const auto* b = (const block_iq2_xs*)  wrow; dq_iq2_xs_one (&b[bi], sw + bi * QK_K);  return QK_K;  }
+        case 18: { const auto* b = (const block_iq3_xxs*) wrow; dq_iq3_xxs_one(&b[bi], sw + bi * QK_K);  return QK_K;  }
+        case 23: { const auto* b = (const block_iq4_xs*)  wrow; dq_iq4_xs_one (&b[bi], sw + bi * QK_K);  return QK_K;  }
         case 29: { const auto* b = (const block_iq1_m*)   wrow; dq_iq1_m_one  (&b[bi], sw + bi * QK_K);  return QK_K;  }
         default: return 0;
     }
@@ -258,6 +365,10 @@ void iq_mmvq_f32(int ggml_type, const void* w, const float* x, float* y, int n_i
     const size_t row_bytes = iq_row_bytes(ggml_type, n_in);
     if (row_bytes == 0) return;   // unsupported type or n_in not a whole number of blocks
     const size_t shmem = (size_t) n_in * sizeof(float);
+    // dynamic + the kernel's 128 B static warp_sum must fit the 48 KB per-block ceiling: the dense-lead
+    // down-projection (n_in = 12288) requests exactly 48 KB dynamic and needs the opt-in to launch.
+    static bool opted = false;
+    if (!opted && shmem >= 48u << 10) { cudaFuncSetAttribute(mmvq_f32_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem); opted = true; }
     mmvq_f32_kernel<<<n_out, 256, shmem, (cudaStream_t) stream>>>(
         (const uint8_t*) w, row_bytes, ggml_type, x, y, n_in, n_out);
 }

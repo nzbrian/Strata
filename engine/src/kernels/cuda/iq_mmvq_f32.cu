@@ -34,7 +34,7 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_
 #define STRATA_QUANT_TABLES
 #define GGML_COMMON_DECL_C
 #define GGML_COMMON_IMPL_C
-#include "../../../third_party/strata-ggml/strata-quant-common.h"
+#include "strata/quant/strata-quant-common.h"
 
 #include "iq_mmvq_f32_tables.inc"   // __device__ codebook tables (values from the same header)
 

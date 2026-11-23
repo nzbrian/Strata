@@ -832,6 +832,28 @@ INKLING_FAMILIES = {
     }
 }
 
+# MiniMax-M3.1-Flash: a separate engine (strata-m3, built from source), so its setup is a self-contained path
+# (m3_setup) rather than the Qwen flow - no MTP draft layer, no vision encoder, no pack.  The GGUFs are the
+# multi-shard files from Hugging Face; the engine mmap's the experts from them.  No SHA-256 pins yet: the files
+# are taken from the repository's current revision (the size is checked, the hash is not - announced).
+M3_FAMILIES = {
+    "minimax-m3": {
+        "title": "MiniMax-M3.1-Flash", "by": "MiniMax; GGUFs by unsloth and AtomicChat",
+        "about": "a 32B mixture-of-experts (128 experts, 4 active) with sparse indexer attention; runs the strata-m3 "
+                 "engine, compiled from this checkout's engine/ for your GPUs (no ready-made build)",
+        "name": "minimax-m3", "arch": "minimax-m3", "m3": True,
+        "license": "MiniMax-M3.1-Flash: https://huggingface.co/MiniMax/MiniMax-M3.1-Flash",
+        "models": {
+            "UD-Q2_K_XL": {"about": "2-bit (Unsloth Dynamic), the smallest", "repo": "unsloth/MiniMax-M3.1-Flash-GGUF",
+                          "shards": 4, "ram_gb": 48},
+            "UD-Q3_K_XL": {"about": "3-bit (Unsloth Dynamic), closer to the full model", "repo": "unsloth/MiniMax-M3.1-Flash-GGUF",
+                          "shards": 5, "ram_gb": 52},
+            "AD-Q2_K": {"about": "2-bit (AtomicChat)", "repo": "AtomicChat/MiniMax-M3.1-Flash-GGUF",
+                       "shards": 4, "ram_gb": 48},
+        },
+    }
+}
+
 # Inkling-2-Mini custom/community local-file & Hugging Face import sources (official HF safetensors + Unsloth GGUFs).
 # Native `.strata` v1.1 (SQ-20, SQ-15, SQ-10 + Vision) remains the flagship recommended default; `strata-inkling` also
 # downloads and loads Unsloth GGUFs (`unsloth/Inkling-2-Mini-GGUF`) and official safetensors directly.
@@ -11195,6 +11217,208 @@ def mac_inkling_setup(a) -> int:
     return install_inkling2(a, a.family or inkling_family.FAMILY, gpu, False, False, None, False, a.port or 8080, ram, None)
 
 
+# ------------------------------------------------------------------------------------------------ MiniMax-M3.1-Flash
+# A self-contained setup path for the strata-m3 engine (see M3_FAMILIES): a separate engine compiled from this
+# checkout's engine/, with no MTP draft layer, no vision encoder and no pack.  The steps: check the GPUs, choose
+# the quant, find or download the GGUF shards, compile the engine for the GPUs, size the expert caches to the
+# VRAM, and write the run config and script.
+
+def _m3_shard_names(quant, shards):
+    total = f"{shards:05d}"
+    return [f"MiniMax-M3.1-Flash-{quant}-{i:05d}-of-{total}.gguf" for i in range(1, shards + 1)]
+
+
+def _m3_hf_hub_root():
+    """The Hugging Face hub cache folder: $HF_HOME/hub when set, else ~/.cache/huggingface/hub."""
+    if os.environ.get("HF_HOME"):
+        return Path(os.environ["HF_HOME"]) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _m3_hf_cache_shard(repo, quant, shard_name):
+    """The shard in the Hugging Face hub cache, wherever its layout puts it (the engine mmap's it: no copy)."""
+    org, repo_name = repo.split("/", 1)
+    cache_root = _m3_hf_hub_root() / f"models--{org}--{repo_name}"
+    if not cache_root.exists():
+        return None
+    for h in cache_root.glob(f"**/{shard_name}"):
+        if h.is_file():
+            return h
+    return None
+
+
+def _m3_gather_shards(quant, model, models_dir):
+    """Every shard of `quant` (a M3_FAMILIES model entry), as paths: from models_dir when already there, from the
+    Hugging Face cache when not (read in place), downloaded to models_dir when in neither."""
+    names = _m3_shard_names(quant, model["shards"])
+    repo = model["repo"]
+    dsts = [Path(models_dir) / f"MiniMax-M3.1-Flash-{quant}" / n for n in names]
+    if all(d.exists() and done(d) for d in dsts):
+        ok(f"the {quant} files are already in {models_dir}")
+        return dsts
+    cached = []
+    for n in names:
+        c = _m3_hf_cache_shard(repo, quant, n)
+        if c is None:
+            cached = []
+            break
+        cached.append(c)
+    if len(cached) == len(names):
+        ok(f"the {quant} files are in the Hugging Face cache ({cached[0].parent}); using them in place")
+        return cached
+    for n, d in zip(names, dsts):
+        if d.exists() and done(d):
+            continue
+        url = f"https://huggingface.co/{repo}/resolve/main/{quant}/{n}"
+        say(f"  downloading {n} (Hugging Face; no SHA-256 pin: the size is checked, the hash is not)")
+        download(url, d, n)
+    return dsts
+
+
+def _m3_find_cuda():
+    """(cuda_home, nvcc) for compiling the engine: CUDA_PATH, then /usr/local/cuda-*, then /usr/local/cuda."""
+    cands = []
+    if os.environ.get("CUDA_PATH"):
+        cands.append(Path(os.environ["CUDA_PATH"]))
+    cands.extend(sorted(Path("/usr/local").glob("cuda-*"), reverse=True))
+    cands.append(Path("/usr/local/cuda"))
+    for c in cands:
+        nvcc = c / "bin" / "nvcc"
+        if nvcc.exists():
+            return c, nvcc
+    return None, None
+
+
+def _m3_build_engine(gpu_archs, a):
+    """Compile strata-m3 from this checkout's engine/ for the chosen GPUs; the path to the binary."""
+    cuda_home, nvcc = _m3_find_cuda()
+    if nvcc is None:
+        fail("no NVIDIA CUDA toolkit found (looked in CUDA_PATH and /usr/local/cuda-*); "
+             "install one to compile the strata-m3 engine")
+    archs = ";".join(f"{x}-real" for x in sorted(set(gpu_archs)))
+    build_dir = ROOT.parent / "build-m3"
+    exe = build_dir / "strata-m3"
+    if exe.exists() and not a.setup:
+        ok(f"the strata-m3 engine is already built ({exe})")
+        return exe
+    say(f"  compiling the strata-m3 engine for {archs} (CUDA {cuda_home.name}) - a few minutes ...")
+    cfg = ["cmake", "-S", str(ROOT.parent / "engine"), "-B", str(build_dir),
+           "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON",
+           f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DCMAKE_CUDA_ARCHITECTURES={archs}"]
+    # long build: run it live (no capture, no timeout) so the user sees the progress; a non-zero exit is a failure
+    for cmd in (cfg, ["ninja", "-C", str(build_dir), "strata-m3"]):
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            fail(f"the strata-m3 engine build failed (exit {rc})",
+                 "check that cmake, ninja and a C++ compiler are installed, and that the CUDA toolkit matches your driver")
+    if not exe.exists():
+        fail("the build finished but strata-m3 is not where it should be", str(exe))
+    ok(f"the strata-m3 engine is built ({exe})")
+    return exe
+
+
+def _m3_slots(vram_gb, reserve_gb):
+    """Expert-cache slots (32 MiB each) for a card: its VRAM less the reserve, clamped to a sane range."""
+    slots = int((max(0.0, vram_gb - reserve_gb)) / 0.032)
+    return max(32, min(256, slots))
+
+
+def _m3_ask_quant(models):
+    say("  which quantization?")
+    for i, (name, m) in enumerate(models.items(), 1):
+        say(f"   {i}. {name} - {m['about']}")
+    while True:
+        try:
+            ans = input(f"  [1-{len(models)}] ").strip()
+        except EOFError:
+            return next(iter(models))
+        if ans.isdigit() and 1 <= int(ans) <= len(models):
+            return list(models)[int(ans) - 1]
+        if ans in models:
+            return ans
+        say("  pick a number")
+
+
+def m3_setup(a) -> int:
+    """MiniMax-M3.1-Flash: the self-contained strata-m3 path (see M3_FAMILIES)."""
+    say("Strata - MiniMax-M3.1-Flash on a normal PC (a GPU + system RAM + CPU)")
+    step(1, "checking your GPUs")
+    cards = gpus()
+    if not cards:
+        fail("no NVIDIA GPU found; the strata-m3 engine needs one")
+    # the strata-m3 engine's --gpus is a COUNT: it always uses the first N cards (indices 0..N-1), GPU 0 the main.
+    # so the number asked for is what the engine will run, on cards 0..N-1.
+    if a.gpus == "all" or a.gpus is None and a.gpu is None:
+        n_want = len(cards)
+    elif a.gpus:
+        n_want = len([x for x in str(a.gpus).split(",") if x.strip()])
+    else:
+        n_want = 1
+    n_want = max(1, min(n_want, len(cards)))
+    by_index = {c["index"]: c for c in cards}
+    chosen = [by_index[i] for i in range(n_want) if i in by_index]
+    if not chosen:
+        fail(f"none of the requested GPUs ({a.gpus or a.gpu}) are usable NVIDIA cards")
+    for c in chosen:
+        say(f"  GPU{c['index']}: {c['name']} ({c['vram_gb']:.0f} GB, sm_{c['arch']})" + (" (main)" if c["index"] == 0 else ""))
+    step(2, "choosing the quantization")
+    models = M3_FAMILIES["minimax-m3"]["models"]
+    quant = a.model if a.model in models else _m3_ask_quant(models)
+    model = models[quant]
+    say(f"  {quant} ({model['about']})")
+    step(3, "finding the model files")
+    data, _ = data_folder_for(a)
+    models_dir = a.models_dir or str(data / "models")
+    shards = _m3_gather_shards(quant, model, models_dir)
+    step(4, "building the strata-m3 engine")
+    exe = _m3_build_engine([c["arch"] for c in chosen], a)
+    step(5, "sizing the expert caches to your VRAM")
+    # VRAM the model itself uses before any expert cache (measured on UD-Q2_K_XL: ~11.8 GB on the main card,
+    # ~9.2 GB on each helper - the quantised weights' VRAM-resident part + KV + scratch).  The reserves leave a
+    # margin over that so the expert-arena cudaMalloc cannot fail.  Bigger quants use a little more; the margin
+    # absorbs it.
+    main_gpu = chosen[0]                                  # the engine's GPU 0: model weights + KV + the vexperts cache
+    vexperts = _m3_slots(main_gpu["vram_gb"], reserve_gb=12.5)
+    helpers = chosen[1:]
+    # every helper shares one --expslots count: size it to the SMALLEST helper so none runs out of VRAM
+    expslots = min((_m3_slots(c["vram_gb"], reserve_gb=10.0) for c in helpers), default=0) if helpers else 0
+    ctx = a.context or 8192
+    say(f"  GPU{main_gpu['index']} (main): {vexperts} expert slots" +
+        (f"; helpers: {expslots} slots each" if expslots else ""))
+    say(f"  context: {ctx}")
+    step(6, "writing the run config")
+    cuda_home, _ = _m3_find_cuda()
+    tag = f"minimax-m3-{quant.lower()}"
+    cfg_path = home() / f"strata-{tag}.json"
+    args = ["--model", str(shards[0]), "--quant", "--gpus", str(len(chosen)), "--vexperts", str(vexperts)]
+    if expslots:
+        args += ["--expslots", str(expslots)]
+    args += ["--ctx", str(ctx)]
+    cfg = {
+        "exe": str(exe), "args": args, "cwd": str(ROOT.parent),
+        "tokenizer": str(ROOT.parent / "pack" / "minimax-m3" / "tokenizer"),
+        "model_name": f"minimax-m3.1-flash-{quant.lower()}",
+        "log": str(home() / f"strata-{tag}.log"),
+        "lib_dirs": ([str(cuda_home / "bin"), str(cuda_home / "lib64")] if cuda_home else []),
+        "port": a.port or 8081,
+        "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+    }
+    cfg_path.write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
+    ok(f"the run config is {cfg_path}")
+    step(7, "writing the run script")
+    script = write_run_script(tag, cfg_path, a.port or 8081, open_browser=a.browser is not False)
+    ok(f"the run script is {script}")
+    if a.no_start:
+        ok(f"done (not started). Start it with: {script}")
+        return 0
+    step(8, "starting the model")
+    say("  loading the model (the first start takes a minute or two) ...")
+    from strata_control import acquisition
+    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata",
+           "--config", str(cfg_path), "--port", str(a.port or 8081)]
+    return subprocess.call(cmd, env={**os.environ, acquisition.ENV: "1"})
+
+
 def main() -> int:
     try:                                               # the engine programs setup runs start no debugger on a user's machine (strata_control/childenv.py)
         from strata_control.childenv import quiet_crash_env
@@ -11217,20 +11441,22 @@ def main() -> int:
     _ink_ask = _peek("--family") in INKLING_FAMILIES or bool(_peek("--model") and model_alias(_peek("--model")) in INKLING_FAMILIES["inkling-2-mini"]["models"])
     if sys.platform == "darwin" and not CONTROL and not _hy4_ask and not _ink_ask:       # a Mac: metal/setup_mac.py (the Metal engine); the app (Control mode), Hy4-Flash and Inkling-2-Mini go on below.
         return mac_setup(sys.argv[1:])                 # (after the retired names above, so a Mac gets the same sentence and exit 2, M1 11-16)
-    if (_peek("--family") and _peek("--family") not in {**FAMILIES, **OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES}) \
+    if (_peek("--family") and _peek("--family") not in {**FAMILIES, **OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES, **M3_FAMILIES}) \
             or (_peek("--model") and not _peek("--family") and model_alias(_peek("--model")) not in MODELS
-                and not any(model_alias(_peek("--model")) in f["models"] for f in {**OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES}.values())):
+                and not any(model_alias(_peek("--model")) in f["models"] for f in {**OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES, **M3_FAMILIES}.values())):
         feed_models_setup(_peek("--feed"))             # a name the built-in tables do not know may be a model of the signed feed
         if _peek("--family") in FEED_UNAVAILABLE:
             fail(f"{FEED_UNAVAILABLE[_peek('--family')]['title']} is {FEED_UNAVAILABLE[_peek('--family')]['reason']}")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES) + list(HY4_FAMILIES) + list(INKLING_FAMILIES),
+    ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES) + list(HY4_FAMILIES) + list(INKLING_FAMILIES) + list(M3_FAMILIES),
                     help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, qwen36 = Qwen3.6-35B-A3B (pictures with --vision, "
                          "several requests at once with --parallel; docs/QWEN36.md), hy4-flash = Tencent Hy4-Flash (SQ-64 / SQ-96 / SQ-128), "
-                         "inkling-2-mini = Thinking Machines Inkling-2-Mini (SQ-20 / SQ-15 / SQ-10)")
+                         "inkling-2-mini = Thinking Machines Inkling-2-Mini (SQ-20 / SQ-15 / SQ-10), "
+                         "minimax-m3 = MiniMax-M3.1-Flash (UD-Q2_K_XL / UD-Q3_K_XL / AD-Q2_K, the strata-m3 engine)")
     ap.add_argument("--model", type=model_alias, choices=list(dict.fromkeys([*MODELS, *(m for f in PREVIEW_FAMILIES.values()
                                                                        for m in f["models"]), *(m for f in HY4_FAMILIES.values() for m in f["models"]),
-                                                                       *(m for f in INKLING_FAMILIES.values() for m in f["models"])])))
+                                                                       *(m for f in INKLING_FAMILIES.values() for m in f["models"]),
+                                                                       *(m for f in M3_FAMILIES.values() for m in f["models"])])))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -11395,8 +11621,8 @@ def main() -> int:
     if getattr(a, "dsv41_package", None):              # DeepSeek's engine package: no longer offered (strata_control/retired.py)
         say("  " + retired.NOT_OFFERED)
         return 2
-    if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES and a.family not in HY4_FAMILIES and a.family not in INKLING_FAMILIES:
-        ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in {**PREVIEW_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES}.items()
+    if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES and a.family not in HY4_FAMILIES and a.family not in INKLING_FAMILIES and a.family not in M3_FAMILIES:
+        ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in {**PREVIEW_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES, **M3_FAMILIES}.items()
                                                               if a.model in d["models"]))
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
@@ -11449,6 +11675,8 @@ def main() -> int:
             a.gpus = ",".join(str(i) for i in order)
         else:
             a.gpu = order[0]
+    if a.family in M3_FAMILIES or (a.model and a.model in M3_FAMILIES["minimax-m3"]["models"]):
+        return m3_setup(a)                                # MiniMax-M3.1-Flash: the self-contained strata-m3 path
     _fams = {**OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES}
     say("Strata - " + (_fams[a.family]["title"] if a.family in _fams else "Qwen3.8-Flash-Next")
         + " on a normal PC (a GPU + system RAM + CPU)")

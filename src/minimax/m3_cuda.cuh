@@ -199,31 +199,31 @@ __global__ void k_msa_attn_pool(const float* __restrict__ q, const float* __rest
     for (int i = t; i < N; i += 128) mx = fmaxf(mx, s_s[i]);
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-    if ((t & 31) == 0) smem[N + 2 * (t >> 5)] = mx;
+    if ((t & 31) == 0) smem[2 * N + 2 * (t >> 5)] = mx;
     __syncthreads();
     if (t == 0) {
-        float m2 = smem[N + 2 * 0];
+        float m2 = smem[2 * N + 2 * 0];
         #pragma unroll
-        for (int w2 = 1; w2 < 4; ++w2) m2 = fmaxf(m2, smem[N + 2 * w2]);
-        smem[N + 2 * 0] = m2;
+        for (int w2 = 1; w2 < 4; ++w2) m2 = fmaxf(m2, smem[2 * N + 2 * w2]);
+        smem[2 * N + 2 * 0] = m2;
     }
     __syncthreads();
-    mx = smem[N + 2 * 0];
+    mx = smem[2 * N + 2 * 0];
     // weights + block sum
     float ls = 0.f;
     for (int i = t; i < N; i += 128) { const float w = (s_s[i] < -1e29f) ? 0.f : expf(s_s[i] - mx); s_w[i] = w; ls += w; }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, o);
-    if ((t & 31) == 0) smem[N + 2 * 1 + (t >> 5)] = ls;
+    if ((t & 31) == 0) smem[2 * N + 2 * 1 + (t >> 5)] = ls;
     __syncthreads();
     if (t == 0) {
-        float l2 = smem[N + 2 * 1];
+        float l2 = smem[2 * N + 2 * 1];
         #pragma unroll
-        for (int w2 = 1; w2 < 4; ++w2) l2 += smem[N + 2 * 1 + w2];
-        smem[N + 2 * 1] = l2;
+        for (int w2 = 1; w2 < 4; ++w2) l2 += smem[2 * N + 2 * 1 + w2];
+        smem[2 * N + 2 * 1] = l2;
     }
     __syncthreads();
-    const float l = smem[N + 2 * 1];
+    const float l = smem[2 * N + 2 * 1];
     // out[t] = sum_i s_w[i] * v[i][t]
     const float* vcol = pv + (size_t) hkv * HD + t;
     float acc = 0.f;
@@ -410,6 +410,131 @@ __global__ void k_scatter_add(float* __restrict__ x, const int* __restrict__ row
     float* xr = x + (size_t) rows[i] * NE;
     const float* yr = y + (size_t) i * NE;
     for (int j = threadIdx.x; j < NE; j += blockDim.x) xr[j] += w * yr[j];
+}
+
+/// MSA pool attention for S chunk positions at once (chunked-prefill counterpart of k_msa_attn_pool).
+/// q: [S][H*HD]; sel: [S][n_groups*B] (1 when position s's group attends to pool block b); last_slot/
+/// last_valid: per-position in-progress block (its tail is padding); out: [S][H*HD]. Same smem layout
+/// and online-softmax recipe as k_msa_attn_pool.
+__global__ void k_msa_attn_pool_c(const float* __restrict__ q, const float* __restrict__ pk, const float* __restrict__ pv,
+                                  const unsigned char* __restrict__ sel, const int* __restrict__ last_slot,
+                                  const int* __restrict__ last_valid, float* __restrict__ out,
+                                  int H, int HKV, int HD, int B, int blk, int S) {
+    extern __shared__ float smem[];
+    const int N = B * blk;
+    float* s_s = smem;          // [N] scores
+    float* s_w = smem + N;      // [N] softmax weights
+    const int h = blockIdx.x, s = blockIdx.y;
+    const int t = threadIdx.x;
+    const int hkv = h / (H / HKV);
+    const float* qh = q + ((size_t) s * H + h) * HD;
+    const unsigned char* sel_s = sel + (size_t) s * HKV * B;   // per-position stride is n_groups(=HKV) x B
+    const int ls = last_slot[s], lv = last_valid[s];
+    const float scale = rsqrtf((float) HD);
+    for (int i = t; i < N; i += 128) {
+        const int b = i / blk, p = i - b * blk;
+        if (!sel_s[(size_t) hkv * B + b] || p >= (b == ls ? lv : blk)) { s_s[i] = -1e30f; continue; }
+        const float* krow = pk + ((size_t) b * blk + p) * HKV * HD + (size_t) hkv * HD;
+        float sc = 0.f;
+        #pragma unroll
+        for (int j = 0; j < HD; ++j) sc += qh[j] * krow[j];
+        s_s[i] = sc * scale;
+    }
+    __syncthreads();
+    float mx = -1e30f;
+    for (int i = t; i < N; i += 128) mx = fmaxf(mx, s_s[i]);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((t & 31) == 0) smem[2 * N + 2 * (t >> 5)] = mx;
+    __syncthreads();
+    if (t == 0) {
+        float m2 = smem[2 * N + 2 * 0];
+        #pragma unroll
+        for (int w2 = 1; w2 < 4; ++w2) m2 = fmaxf(m2, smem[2 * N + 2 * w2]);
+        smem[2 * N + 2 * 0] = m2;
+    }
+    __syncthreads();
+    mx = smem[2 * N + 2 * 0];
+    float ls2 = 0.f;
+    for (int i = t; i < N; i += 128) { const float w = (s_s[i] < -1e29f) ? 0.f : expf(s_s[i] - mx); s_w[i] = w; ls2 += w; }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ls2 += __shfl_xor_sync(0xffffffffu, ls2, o);
+    if ((t & 31) == 0) smem[2 * N + 2 * 1 + (t >> 5)] = ls2;
+    __syncthreads();
+    if (t == 0) {
+        float l2 = smem[2 * N + 2 * 1];
+        #pragma unroll
+        for (int w2 = 1; w2 < 4; ++w2) l2 += smem[2 * N + 2 * 1 + w2];
+        smem[2 * N + 2 * 1] = l2;
+    }
+    __syncthreads();
+    const float l = smem[2 * N + 2 * 1];
+    const float* vcol = pv + (size_t) hkv * HD + t;
+    float acc = 0.f;
+    for (int i = 0; i < N; ++i) acc += s_w[i] * vcol[(size_t) i * HKV * HD];
+    out[((size_t) s * H + h) * HD + t] = acc * (l > 0.f ? 1.f / l : 0.f);
+}
+
+/// MSA indexer scoring for C chunk positions: out[q][b] = max over the b-th BLK-key block of
+/// dot(q[q], keys[p]), CAUSALLY masked: query q (position p0 + q/nsg) only sees keys with p < that
+/// position + 1.  `keys` is pinned RAM read over PCIe via UVA [n_pos][DIM] (read ONCE per key block:
+/// one block owns a whole key block and streams all Q queries through it in subtiles); `q` is
+/// [Q][DIM] on the device (Q = C * nsg); `out` is [Q][nblk] pre-filled with -INFINITY.
+template <int DIM, int BLK>
+__global__ void __launch_bounds__(256) k_idx_gemm(const float* __restrict__ keys, const float* __restrict__ q,
+                                                  float* __restrict__ out, int n_pos, int Q, int nblk,
+                                                  int p0, int nsg) {
+    extern __shared__ float smem[];
+    float* sk = smem;                    // [BLK][DIM] key block (read once)
+    float* sq = smem + BLK * DIM;        // [32][DIM] query subtile (streamed)
+    const int b = blockIdx.x;
+    const int t = threadIdx.x;
+    const int first = b * BLK;
+    for (int i = t; i < BLK * DIM; i += 256) {
+        const int p = i / DIM, d = i - p * DIM;
+        sk[i] = (first + p < n_pos) ? keys[(size_t) (first + p) * DIM + d] : 0.f;
+    }
+    constexpr int KPG = BLK / 8;         // keys per thread-group
+    const int ql = t % 32, kg = t / 32;  // 8 key groups
+    const int Qp = (Q + 31) & ~31;       // Q need not be a multiple of 32 (C*ns); pad the last subtile
+    for (int qs = 0; qs < Qp / 32; ++qs) {
+        for (int i = t; i < 32 * DIM; i += 256) {
+            const int qq = i / DIM, d = i - qq * DIM;
+            const int qg = qs * 32 + qq;
+            sq[i] = (qg < Q) ? q[(size_t) qg * DIM + d] : 0.f;
+        }
+        __syncthreads();
+        const int qg = qs * 32 + ql;
+        float m = -1e30f;
+        bool valid = false;
+        if (qg < Q) {                    // padded query (last partial subtile): no score to write
+            const int npos_i = p0 + qg / nsg + 1;   // this query's causal key count
+            #pragma unroll
+            for (int k = 0; k < KPG; ++k) {
+                const int p = kg * KPG + k;
+                if (first + p >= npos_i) continue;
+                valid = true;
+                const float* kr = sk + p * DIM;
+                const float* qr = sq + ql * DIM;
+                float s = 0.f;
+                #pragma unroll
+                for (int d = 0; d < DIM; ++d) s += kr[d] * qr[d];
+                if (s > m) m = s;
+            }
+        }
+        if (valid) {
+            float* addr = out + (size_t) (qs * 32 + ql) * nblk + b;
+            float old = *addr;
+            while (m > old && atomicCAS((int*) addr, __float_as_int(old), __float_as_int(m)) != old) old = *addr;
+        }
+        __syncthreads();
+    }
+}
+
+/// Fill with -INFINITY (cudaMemset cannot express it).
+__global__ void k_fill_neg_inf(float* __restrict__ x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = -INFINITY;
 }
 
 }  // namespace m3k

@@ -711,6 +711,12 @@ struct RamKv {
     float *q_relay = nullptr, *da_relay = nullptr;   // pinned: GPU0 <-> pool GPU
     float *pool_q[kNgpu] = { nullptr }, *pool_da[kNgpu] = { nullptr };  // per-pool-GPU q/da (H*HD floats)
     unsigned char *dsel[kNgpu] = { nullptr };        // per-pool-GPU selection mask
+    // Chunked-prefill relays: S_MAX positions at once (the sub-batch size of m3_layer_attn_chunk)
+    static constexpr int kSub = 16;
+    float *q_relay_c = nullptr, *da_relay_c = nullptr;   // pinned: S_MAX*H*HD
+    float *pool_q_c[kNgpu] = { nullptr }, *pool_da_c[kNgpu] = { nullptr };
+    unsigned char *dsel_c[kNgpu] = { nullptr };          // [S_MAX][4][kPoolBlocks]
+    int *lv_c[kNgpu] = { nullptr };                      // [S_MAX] last_slot + [S_MAX] last_valid
     int *pool_blk = nullptr, *pool_age = nullptr;  // host LRU state [n_sparse][kPoolBlocks]
     int n_sparse = 0, cap = 0, n_pos = 0, age = 0, layers_per_gpu = 0;
     bool ready = false;
@@ -741,6 +747,17 @@ struct RamKv {
             cudaSetDevice(g);
             if (cudaMalloc(&pool_q[g], qbytes) != cudaSuccess || cudaMalloc(&pool_da[g], qbytes) != cudaSuccess) { err = "ram kv q/da"; return false; }
         }
+        // chunk relays (S_MAX positions)
+        const size_t qcb = (size_t) kSub * qhd * 4;
+        if (cudaHostAlloc(&q_relay_c, qcb, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc(&da_relay_c, qcb, cudaHostAllocDefault) != cudaSuccess) { err = "ram kv relay_c"; return false; }
+        for (int g = 0; g < kNgpu; ++g) {
+            cudaSetDevice(g);
+            if (cudaFuncSetAttribute((const void*) m3k::k_msa_attn_pool_c, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes) != cudaSuccess ||
+                cudaMalloc(&pool_q_c[g], qcb) != cudaSuccess || cudaMalloc(&pool_da_c[g], qcb) != cudaSuccess ||
+                cudaMalloc(&dsel_c[g], (size_t) kSub * 4 * kPoolBlocks) != cudaSuccess ||
+                cudaMalloc(&lv_c[g], (size_t) kSub * 2 * (int) sizeof(int)) != cudaSuccess) { err = "ram kv pool_c"; return false; }
+        }
         cudaSetDevice(0);
         pool_blk = new int[ns * kPoolBlocks];
         pool_age = new int[ns * kPoolBlocks];
@@ -755,9 +772,13 @@ struct RamKv {
             if (pool_k[g]) { cudaFree(pool_k[g]); cudaFree(pool_v[g]); pool_k[g] = pool_v[g] = nullptr; }
             if (dsel[g]) { cudaFree(dsel[g]); dsel[g] = nullptr; }
             if (pool_q[g]) { cudaFree(pool_q[g]); cudaFree(pool_da[g]); pool_q[g] = pool_da[g] = nullptr; }
+            if (pool_q_c[g]) { cudaFree(pool_q_c[g]); cudaFree(pool_da_c[g]); pool_q_c[g] = pool_da_c[g] = nullptr; }
+            if (dsel_c[g]) { cudaFree(dsel_c[g]); dsel_c[g] = nullptr; }
+            if (lv_c[g]) { cudaFree(lv_c[g]); lv_c[g] = nullptr; }
             if (pool_st[g]) { cudaStreamDestroy(pool_st[g]); pool_st[g] = nullptr; }
         }
         if (q_relay) { cudaFreeHost(q_relay); cudaFreeHost(da_relay); q_relay = da_relay = nullptr; }
+        if (q_relay_c) { cudaFreeHost(q_relay_c); cudaFreeHost(da_relay_c); q_relay_c = da_relay_c = nullptr; }
         delete[] pool_blk; pool_blk = pool_age = nullptr;
         ready = false; n_pos = 0;
     }
@@ -982,14 +1003,12 @@ bool forward_gpu(Model& m, const std::vector<int>& tokens, int n_layers, bool us
                 m3k::k_attn<<<H, HD, 0, st>>>(dq2, dkv_k, dkv_v, da, H, HKV, HD, t + 1, cap, t);
             }
             if (t == T - 1)
-if (getenv("M3_DBG_DA") && l == 3) { std::vector<float> d((size_t) H * HD); cudaMemcpyAsync(d.data(), da, (size_t) H * HD * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); FILE* f = fopen("/tmp/da3_fwd.txt", "w"); for (int i = 0; i < (int) d.size(); ++i) fprintf(f, "%.6f\n", d[i]); fclose(f); }
             if (die("attn")) return false;
             if (g_dump_da && l == 0 && t == T - 1) { g_dump_da_data.resize((size_t) H * HD); cudaMemcpyAsync(g_dump_da_data.data(), da, (size_t) H * HD * sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); }
             // output projection
             if (!mmf(wo, da, hq8, do_, H * HD, NE)) return false;
             m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, do_, NE);
             if (t == T - 1)
-if (getenv("M3_DBG_XT") && t == T - 1) { std::vector<float> d((size_t) NE); cudaMemcpyAsync(d.data(), xt, (size_t) NE * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); FILE* f = fopen((std::string("/tmp/xt_") + std::to_string(l) + "_fwd.txt").c_str(), "w"); for (int i2 = 0; i2 < (int) d.size(); ++i2) fprintf(f, "%.6f\n", d[i2]); fclose(f); }
             if (die("add1")) return false;
             if (g_dump_xa && l == 0 && t == T - 1) { std::vector<float> d(NE); cudaMemcpyAsync(d.data(), xt, (size_t)NE*sizeof(float), cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); std::FILE* f=std::fopen(g_dump_xa,"w"); for(int i=0;i<NE;++i) std::fprintf(f,"%.6f\n",d[i]); std::fclose(f); }
         }
@@ -1293,6 +1312,7 @@ struct M3DecodeState {
         float *bnc[4] = {nullptr, nullptr, nullptr, nullptr};
         int bnc_i = 0;
         int *rows=nullptr;
+        float *score_blk = nullptr;   // [C*ns][nblk_max] indexer block scores (GPU0)
         int C = 0;
     } chunk;
     bool ready = false;
@@ -1432,7 +1452,7 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
     if (!ds.ram.init(ds.n_sparse, cap, HKV, HD, m.idx.dim, m.idx.blk, H * HD, err)) { err = "ram kv: " + err; return false; }
     if (cudaMalloc(&ds.d_part, (size_t) NE * sizeof(float)) != cudaSuccess) { err = "d_part allocation"; return false; }
     {   // chunked-prefill scratch: C rows of every per-position buffer
-        const int C = 256;
+        const int C = 1024;
         const size_t NEb = (size_t) NE * 4, HDb = (size_t) H * HD * 4, KHDb = (size_t) HKV * HD * 4,
                      NFFb = (size_t) NFF * 4, NFFDb = (size_t) NFFD * 4,
                      IDb = (size_t) m.idx.n_groups * m.idx.dim * 4, ID1b = (size_t) m.idx.dim * 4;
@@ -1445,6 +1465,7 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
             !cm(&c.dout, C*NEb) || !cm(&c.score, C*(size_t) m.geom.n_expert * 4) ||
             !cm(&c.idxs, (size_t) C * 8192 * 4) ||
             !cm(&c.bnc[0], C*NFFDb) || !cm(&c.bnc[1], C*NFFDb) || !cm(&c.bnc[2], C*NFFDb) || !cm(&c.bnc[3], C*NFFDb) ||
+            !cm(&c.score_blk, (size_t) C * m.idx.n_groups * ((cap + m.idx.blk - 1) / m.idx.blk) * 4) ||
             cudaMalloc(&c.rows, (size_t) C * m.geom.n_expert * 4)) {
             err = "chunk scratch"; return false;
         }
@@ -1623,7 +1644,8 @@ bool m3_layer_attn(Model& m, M3DecodeState& ds, int l, int P, float* xt, std::st
         if (die("attn")) return false;
         if (!mmf(L.wo, da, do_, H * HD, NE)) return false;
         m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, do_, NE);
-        if (die("add1")) return false;    return true;
+        if (die("add1")) return false;
+    return true;
 }
 
 bool m3_layer_ffn(Model& m, M3DecodeState& ds, int vexp_slots, int l, float* xt, std::string& err) {
@@ -1870,6 +1892,213 @@ bool m3_step_layer(Model& m, M3DecodeState& ds, int vexp_slots, int l, int P, fl
 // kernel stores to some of the long-lived scratch buffers are silently lost,
 // while the bounce buffers are reliable.
 
+// ===========================================================================
+// Chunked sparse attention: C positions in one pass.  The indexer runs as a GPU GEMM that streams
+// key blocks from pinned RAM (UVA) so the O(C x prefix) scoring never touches the CPU; selection,
+// pool LRU and the q/da relays are batched per RamKv::kSub-position sub-batch.  Must reproduce
+// m3_layer_attn's sparse path: same F32 scores, same selection, same pool contents at attention time.
+bool m3_layer_attn_chunk(Model& m, M3DecodeState& ds, int l, float* x_c, int C, int P0, std::string& err) {
+    const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD;
+    auto& SC = ds.scratch;
+    auto& c = ds.chunk;
+    auto& ram = ds.ram;
+    cudaStream_t st = SC.st;
+    auto die = [&](const char* w) -> bool { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; } return false; };
+    auto mmq_c = [&](const M3DecodeState::QW& w, const float* x, float* y, int n_in, int n_out, float*& out) -> bool {
+        out = c.bnc[c.bnc_i];
+        c.bnc_i = (c.bnc_i + 1) & 3;
+        if (w.type == (int64_t) Q::Type::F32) {
+            K::iq_mmq_f32_chunk_f32w((const float*) w.d, x, out, n_in, n_out, C, st);
+        } else {
+            if (K::iq_row_bytes((int) w.type, n_in) == 0) { err = "chunk GEMM: unsupported type " + std::to_string(w.type); return false; }
+            K::iq_mmq_f32_chunk((int) w.type, w.d, x, out, n_in, n_out, C, st);
+        }
+        return !die("mmq_c");
+    };
+    const auto& L = ds.layers[l];
+    const int si = l - ds.dense_lead;
+    const int ns = m.idx.n_groups, idim = m.idx.dim, blk = m.idx.blk, nb = RamKv::kPoolBlocks, S = RamKv::kSub;
+    const size_t kvn = (size_t) HKV * HD;
+    // projections for all C positions (bounce rotation: q,k,v / iq,ik / wo - each consumer reads its
+    // buffer before the next GEMM that reuses the slot)
+    m3k::k_rms<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(x_c, L.an, c.h, NE, (float) m.geom.rms_eps);
+    float *q, *k, *v;
+    if (!mmq_c(L.wq, c.h, nullptr, NE, H * HD, q)) return false;
+    if (!mmq_c(L.wk, c.h, nullptr, NE, HKV * HD, k)) return false;
+    if (!mmq_c(L.wv, c.h, nullptr, NE, HKV * HD, v)) return false;
+    // grid.y is capped at 65535: split the row range when C*H overflows it
+    auto rms_c = [&](const float* y, const float* w, float* x, int rows, int width) {
+        const int r1 = std::min(rows, 65535);
+        m3k::k_rms<<<dim3(1, r1), width, 0, st>>>(y, w, x, width, m.dims.eps);
+        if (rows > 65535)
+            m3k::k_rms<<<dim3(1, rows - 65535), width, 0, st>>>(y + (size_t) 65535 * width, w, x + (size_t) 65535 * width, width, m.dims.eps);
+    };
+    rms_c(q, L.qn, c.q2, C * H, HD);
+    if (die("rms q2")) return false;
+    rms_c(k, L.kn, c.k2, C * HKV, HD);
+    if (die("rms k2")) return false;
+    m3k::k_rope_c<<<dim3(H + HKV, C), m.dims.n_rot / 2, 0, st>>>(c.q2, c.k2, H, HKV, HD, m.dims.n_rot, (float) P0, m.dims.rope_base, C);
+    if (die("rope_c qk")) return false;
+    float *iq, *ik;
+    iq = c.bnc[c.bnc_i]; c.bnc_i = (c.bnc_i + 1) & 3;
+    K::iq_mmq_f32_chunk_f32w(L.idxq, c.h, iq, NE, ns * idim, C, st);
+    ik = c.bnc[c.bnc_i]; c.bnc_i = (c.bnc_i + 1) & 3;
+    K::iq_mmq_f32_chunk_f32w(L.idxk, c.h, ik, NE, idim, C, st);
+    if (die("indexer GEMM")) return false;
+    m3k::k_rms<<<dim3(1, C * ns), idim, 0, st>>>(iq, L.idxqn, iq, idim, m.dims.eps);
+    if (die("rms iq")) return false;
+    m3k::k_rms<<<dim3(1, C), idim, 0, st>>>(ik, L.idxkn, ik, idim, m.dims.eps);
+    if (die("rms ik")) return false;
+    m3k::k_rope_c<<<dim3(ns + 1, C), m.dims.n_rot / 2, 0, st>>>(iq, ik, ns, 1, idim, m.dims.n_rot, (float) P0, m.dims.rope_base, C);
+    if (die("attn_c projections")) return false;
+    (void) 0;
+    // one D2H batch: this sub-chunk's k/v (RAM append) + indexer keys; the indexer q stays on the GPU
+    {
+        std::vector<float> down(2 * (size_t) C * kvn + (size_t) C * idim);
+        cudaMemcpyAsync(down.data(), c.k2, (size_t) C * kvn * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(down.data() + (size_t) C * kvn, v, (size_t) C * kvn * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(down.data() + 2 * (size_t) C * kvn, ik, (size_t) C * idim * 4, cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        for (int i = 0; i < C; ++i) {
+            const int P = P0 + i;
+            std::memcpy(ram.rk + ((size_t) si * ram.cap + P) * kvn, down.data() + (size_t) i * kvn, kvn * 4);
+            std::memcpy(ram.rv + ((size_t) si * ram.cap + P) * kvn, down.data() + (size_t) C * kvn + (size_t) i * kvn, kvn * 4);
+            std::memcpy(ram.rik + ((size_t) si * ram.cap + P) * idim, down.data() + 2 * (size_t) C * kvn + (size_t) i * idim, idim * 4);
+        }
+    }
+    // GPU indexer scoring: scores[q][b] = max over block b of dot(q, key), keys streamed from pinned RAM
+    const int npos = P0 + C, nblk = (npos + blk - 1) / blk, Q = C * ns;
+    m3k::k_fill_neg_inf<<<(Q * nblk + 255) / 256, 256, 0, st>>>(c.score_blk, Q * nblk);
+    if (die("fill_neg_inf")) return false;
+    const int smem_gemm = (blk + 32) * idim * (int) sizeof(float);   // blk=128, idim=128 -> 80 KB (opt-in); blk=16 -> 24 KB
+    static bool idx_opted16 = false, idx_opted128 = false;
+    if (idim == 128 && blk == 128 && !idx_opted128) {
+        if (cudaFuncSetAttribute((const void*) m3k::k_idx_gemm<128, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_gemm) != cudaSuccess) { err = "idx gemm smem opt-in"; return false; }
+        idx_opted128 = true;
+    }
+    {
+        const float* ikdev = ram.rik + (size_t) si * ram.cap * idim;
+        if (idim == 128 && blk == 16) m3k::k_idx_gemm<128, 16><<<nblk, 256, smem_gemm, st>>>(ikdev, iq, c.score_blk, npos, Q, nblk, P0, ns);
+        else if (idim == 128 && blk == 128) m3k::k_idx_gemm<128, 128><<<nblk, 256, smem_gemm, st>>>(ikdev, iq, c.score_blk, npos, Q, nblk, P0, ns);
+        else if (idim == 64 && blk == 16) m3k::k_idx_gemm<64, 16><<<nblk, 256, smem_gemm, st>>>(ikdev, iq, c.score_blk, npos, Q, nblk, P0, ns);
+        else { err = "idx gemm: unsupported (idim, blk)=" + std::to_string(idim) + "," + std::to_string(blk); return false; }
+    }
+    if (die("idx gemm")) return false;
+    std::vector<float> scores((size_t) Q * nblk);
+    cudaMemcpyAsync(scores.data(), c.score_blk, scores.size() * 4, cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (die("scores D2H")) return false;
+    // host selection (same recipe as the decode path: local-block force bias, then top-k per group).
+    // select_blocks returns nblk blocks when nblk < topk - in the chunk path nblk spans the whole chunk,
+    // so for early positions that includes all-FUTURE blocks (-inf score) which the decode path never
+    // selects (its nblk stops at P+1).  An unmasked future block in the pool mask would be attended to
+    // with live dot products - filter it out.
+    std::vector<mm::BlockSel> sels((size_t) C * ns);
+    for (int i = 0; i < C; ++i) {
+        const long long own = (P0 + i) / blk;
+        for (int g = 0; g < ns; ++g) {
+            float* sc = scores.data() + ((size_t) i * ns + g) * nblk;
+            for (int lb = 0; lb < m.idx.local && own - lb >= 0; ++lb) sc[own - lb] += mm::kLocalForceBias;
+            mm::BlockSel sel = mm::select_blocks(sc, nblk, m.idx.topk);
+            int n2 = 0;
+            for (int j = 0; j < sel.n; ++j)
+                if (sc[sel.blocks[j]] > -1e29f) sel.blocks[n2++] = sel.blocks[j];
+            sel.n = n2;
+            sels[(size_t) i * ns + g] = sel;
+        }
+    }
+    // sub-batches: pool LRU + fetch + relay + pool attention
+    const int pg = ram.gpu_of(si), pl = ram.local_of(si);
+    cudaStream_t pst = ram.pool_st[pg];
+    cudaSetDevice(pg);
+    int* pblk = ram.pool_blk + (size_t) si * nb;
+    int* page = ram.pool_age + (size_t) si * nb;
+    auto ck = [&](const char* w) { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); } return e == cudaSuccess; };
+    for (int s0 = 0; s0 < C; s0 += S) {
+        const int Sc = std::min(S, C - s0);
+        std::vector<int> union_blk;
+        union_blk.reserve((size_t) Sc * ns * m.idx.topk);
+        {
+            std::vector<unsigned char> seen((size_t) nblk, 0);
+            for (int i = 0; i < Sc; ++i)
+                for (int g = 0; g < ns; ++g) {
+                    const auto& sel = sels[(size_t) (s0 + i) * ns + g];
+                    for (int j = 0; j < sel.n; ++j)
+                        if (!seen[sel.blocks[j]]) { seen[sel.blocks[j]] = 1; union_blk.push_back(sel.blocks[j]); }
+                }
+        }
+        const int inprog0 = (P0 + s0) / blk, inprog1 = (P0 + s0 + Sc - 1) / blk;
+        for (int b : union_blk) {
+            int slot = -1;
+            for (int s = 0; s < nb; ++s) if (pblk[s] == b) { slot = s; break; }
+            bool fresh = false;
+            if (slot < 0) {
+                int victim = -1;
+                for (int s = 0; s < nb; ++s) {
+                    bool needed = false;
+                    for (int u : union_blk) if (pblk[s] == u) { needed = true; break; }
+                    if (pblk[s] < 0 || (!needed && (victim < 0 || page[s] < page[victim]))) victim = s;
+                }
+                pblk[victim] = b;
+                slot = victim;
+                fresh = true;
+            }
+            page[slot] = ++ram.age;
+            if (fresh || b == inprog0 || b == inprog1) {
+                const size_t base = (size_t) si * ram.cap + (size_t) b * blk;
+                const float* srck = ram.rk + base * kvn;
+                const float* srcv = ram.rv + base * kvn;
+                float* pok = ram.pool_k[pg] + ((size_t) pl * nb + slot) * (size_t) blk * kvn;
+                float* pov = ram.pool_v[pg] + ((size_t) pl * nb + slot) * (size_t) blk * kvn;
+                cudaMemcpyAsync(pok, srck, (size_t) blk * kvn * 4, cudaMemcpyHostToDevice, pst);
+                if (!ck("fetch k H2D")) return false;
+                cudaMemcpyAsync(pov, srcv, (size_t) blk * kvn * 4, cudaMemcpyHostToDevice, pst);
+                if (!ck("fetch v H2D")) return false;
+            }
+        }
+        // BLOCK layout: [slots x Sc][valids x Sc] - the kernel takes (last_slot, last_valid = last_slot + Sc)
+        std::vector<int> lv(2 * Sc);
+        for (int i = 0; i < Sc; ++i) {
+            const int P = P0 + s0 + i;
+            int slot = -1;
+            for (int s = 0; s < nb; ++s) if (pblk[s] == P / blk) { slot = s; break; }
+            lv[i] = slot;
+            lv[Sc + i] = P % blk + 1;
+        }
+        std::vector<unsigned char> sel_pool((size_t) Sc * ns * nb, 0);
+        for (int i = 0; i < Sc; ++i)
+            for (int g = 0; g < ns; ++g)
+                for (int j = 0; j < sels[(size_t) (s0 + i) * ns + g].n; ++j)
+                    for (int s = 0; s < nb; ++s)
+                        if (pblk[s] == sels[(size_t) (s0 + i) * ns + g].blocks[j]) sel_pool[(size_t) (i * ns + g) * nb + s] = 1;
+        cudaMemcpyAsync(ram.dsel_c[pg], sel_pool.data(), sel_pool.size(), cudaMemcpyHostToDevice, pst);
+        cudaMemcpyAsync(ram.lv_c[pg], lv.data(), lv.size() * 4, cudaMemcpyHostToDevice, pst);
+        cudaSetDevice(0);
+        cudaMemcpyAsync(ram.q_relay_c, c.q2 + (size_t) s0 * H * HD, (size_t) Sc * H * HD * 4, cudaMemcpyDeviceToHost, st);
+        if (cudaStreamSynchronize(st) != cudaSuccess) { err = "q D2H sync"; return false; }
+        cudaSetDevice(pg);
+        cudaMemcpyAsync(ram.pool_q_c[pg], ram.q_relay_c, (size_t) Sc * H * HD * 4, cudaMemcpyHostToDevice, pst);
+        if (!ck("q H2D")) return false;
+        const int smem_bytes = (nb * blk * 2 + 8) * (int) sizeof(float);
+        m3k::k_msa_attn_pool_c<<<dim3(H, Sc), HD, smem_bytes, pst>>>(ram.pool_q_c[pg],
+            ram.pool_k[pg] + (size_t) pl * nb * (size_t) blk * kvn,
+            ram.pool_v[pg] + (size_t) pl * nb * (size_t) blk * kvn,
+            ram.dsel_c[pg], ram.lv_c[pg], ram.lv_c[pg] + Sc, ram.pool_da_c[pg], H, HKV, HD, nb, blk, Sc);
+        if (!ck("pool_c launch")) return false;
+        cudaMemcpyAsync(ram.da_relay_c, ram.pool_da_c[pg], (size_t) Sc * H * HD * 4, cudaMemcpyDeviceToHost, pst);
+        if (cudaStreamSynchronize(pst) != cudaSuccess) { err = "pool attn sync"; return false; }
+        cudaSetDevice(0);
+        cudaMemcpyAsync(c.a + (size_t) s0 * H * HD, ram.da_relay_c, (size_t) Sc * H * HD * 4, cudaMemcpyHostToDevice, st);
+        if (!ck("da H2D")) return false;
+    }
+    float *o;
+    if (!mmq_c(L.wo, c.a, nullptr, H * HD, NE, o)) return false;
+    m3k::k_add<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(x_c, o, NE);
+    if (die("attn_c out")) return false;
+    return true;
+}
+
+
 bool m3_layer_ffn_chunk(Model& m, M3DecodeState& ds, int vexp_slots, int l, float* x_c, int C, std::string& err) {
     const int NE = ds.NE, NFF = ds.NFF;
     auto& SC = ds.scratch;
@@ -1983,6 +2212,13 @@ bool m3_prefill_chunk(Model& m, M3DecodeState& ds, int vexp_slots,
         }
         return !die("mmq_c");
     };
+    // grid.y is capped at 65535: split the row range when C*H overflows it
+    auto rms_c = [&](const float* y, const float* w, float* x, int rows, int width) {
+        const int r1 = std::min(rows, 65535);
+        m3k::k_rms<<<dim3(1, r1), width, 0, st>>>(y, w, x, width, m.dims.eps);
+        if (rows > 65535)
+            m3k::k_rms<<<dim3(1, rows - 65535), width, 0, st>>>(y + (size_t) 65535 * width, w, x + (size_t) 65535 * width, width, m.dims.eps);
+    };
     // embed the C tokens
     {
         std::vector<int32_t> t32(tokens, tokens + C);
@@ -1999,8 +2235,8 @@ bool m3_prefill_chunk(Model& m, M3DecodeState& ds, int vexp_slots,
             if (!mmq_c(L.wq, c.h, nullptr, NE, H * HD, q)) return false;
             if (!mmq_c(L.wk, c.h, nullptr, NE, HKV * HD, k)) return false;
             if (!mmq_c(L.wv, c.h, nullptr, NE, HKV * HD, v)) return false;
-            m3k::k_rms<<<dim3(1, C * H), HD, 0, st>>>(q, L.qn, c.q2, HD, m.dims.eps);
-            m3k::k_rms<<<dim3(1, C * HKV), HD, 0, st>>>(k, L.kn, c.k2, HD, m.dims.eps);
+            rms_c(q, L.qn, c.q2, C * H, HD);
+            rms_c(k, L.kn, c.k2, C * HKV, HD);
             m3k::k_rope_c<<<dim3(H + HKV, C), m.dims.n_rot / 2, 0, st>>>(c.q2, c.k2, H, HKV, HD,
                 m.dims.n_rot, (float) P0, m.dims.rope_base, C);
             if (die("rope_c")) return false;
@@ -2032,13 +2268,8 @@ bool m3_prefill_chunk(Model& m, M3DecodeState& ds, int vexp_slots,
             m3k::k_add<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(c.x, df, NE);
             if (die("dense_ffn")) return false;
         } else {
-            // ---- sparse layer: per-position attention + grouped chunk FFN ----
-            for (int i = 0; i < C; ++i) {
-                const int P = P0 + i;
-                cudaMemcpyAsync(SC.dx, c.x + (size_t) i * NE, (size_t) NE * 4, cudaMemcpyDeviceToDevice, st);
-                if (!m3_layer_attn(m, ds, l, P, SC.dx, err)) return false;
-                cudaMemcpyAsync(c.x + (size_t) i * NE, SC.dx, (size_t) NE * 4, cudaMemcpyDeviceToDevice, st);
-            }
+            // ---- sparse layer: parallel attention (GPU indexer + sub-batched pool) + grouped chunk FFN ----
+            if (!m3_layer_attn_chunk(m, ds, l, c.x, C, P0, err)) return false;
             if (!m3_layer_ffn_chunk(m, ds, vexp_slots, l, c.x, C, err)) return false;
         }
     }

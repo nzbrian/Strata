@@ -1285,6 +1285,16 @@ struct M3DecodeState {
         int32_t* dtok=nullptr;
         cudaStream_t st=nullptr;
     } scratch;
+    // Chunked-prefill scratch (C = chunk rows), allocated once in m3_decode_init.
+    struct Chunk {
+        float *x=nullptr, *h=nullptr, *q=nullptr, *k=nullptr, *v=nullptr, *a=nullptr, *o=nullptr;
+        float *iq=nullptr, *ik=nullptr, *q2=nullptr, *k2=nullptr, *ckv_k=nullptr, *ckv_v=nullptr;
+        float *gate=nullptr, *up=nullptr, *hh=nullptr, *df=nullptr, *dout=nullptr, *score=nullptr, *idxs=nullptr;
+        float *bnc[4] = {nullptr, nullptr, nullptr, nullptr};
+        int bnc_i = 0;
+        int *rows=nullptr;
+        int C = 0;
+    } chunk;
     bool ready = false;
 };
 // One per process: initialised at startup (before READY) in serve mode, so "ready" means ready to serve
@@ -1421,6 +1431,24 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
         cudaMalloc(&ds.dkv_v, (size_t) ds.dense_lead * HKV * cap * HD * sizeof(float)) != cudaSuccess) { err = "dense KV allocation: " + std::string(cudaGetErrorString(cudaGetLastError())); return false; }
     if (!ds.ram.init(ds.n_sparse, cap, HKV, HD, m.idx.dim, m.idx.blk, H * HD, err)) { err = "ram kv: " + err; return false; }
     if (cudaMalloc(&ds.d_part, (size_t) NE * sizeof(float)) != cudaSuccess) { err = "d_part allocation"; return false; }
+    {   // chunked-prefill scratch: C rows of every per-position buffer
+        const int C = 256;
+        const size_t NEb = (size_t) NE * 4, HDb = (size_t) H * HD * 4, KHDb = (size_t) HKV * HD * 4,
+                     NFFb = (size_t) NFF * 4, NFFDb = (size_t) NFFD * 4,
+                     IDb = (size_t) m.idx.n_groups * m.idx.dim * 4, ID1b = (size_t) m.idx.dim * 4;
+        auto cm = [&](float** p, size_t bytes) { if (cudaMalloc(p, bytes) != cudaSuccess) return false; return true; };
+        auto& c = ds.chunk; c.C = C;
+        if (!cm(&c.x, C*NEb) || !cm(&c.h, C*NEb) || !cm(&c.q, C*HDb) || !cm(&c.k, C*KHDb) || !cm(&c.v, C*KHDb) ||
+            !cm(&c.a, C*HDb) || !cm(&c.o, C*NEb) || !cm(&c.iq, C*IDb) || !cm(&c.ik, C*ID1b) ||
+            !cm(&c.q2, C*HDb) || !cm(&c.k2, C*KHDb) || !cm(&c.ckv_k, C*KHDb) || !cm(&c.ckv_v, C*KHDb) ||
+            !cm(&c.gate, C*NFFb) || !cm(&c.up, C*NFFb) || !cm(&c.hh, C*NFFb) || !cm(&c.df, C*NEb) ||
+            !cm(&c.dout, C*NEb) || !cm(&c.score, C*(size_t) m.geom.n_expert * 4) ||
+            !cm(&c.idxs, (size_t) C * 8192 * 4) ||
+            !cm(&c.bnc[0], C*NFFDb) || !cm(&c.bnc[1], C*NFFDb) || !cm(&c.bnc[2], C*NFFDb) || !cm(&c.bnc[3], C*NFFDb) ||
+            cudaMalloc(&c.rows, (size_t) C * m.geom.n_expert * 4)) {
+            err = "chunk scratch"; return false;
+        }
+    }
     {
         auto& S = ds.scratch;
         auto A = [&](float** p, size_t n) { return cudaMalloc(p, n * sizeof(float)) == cudaSuccess; };
@@ -1440,57 +1468,26 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
 
 // One decode step: process `token_id` at position ds.n_pos, attending to 0..P from the persistent cache,
 // appending its k/v, and returning the next-token logits. Advances ds.n_pos by one on success.
-bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
-                    std::vector<float>& logits, std::string& err, bool prefill_only = false) {
-    if (!ds.ready) { err = "decode state not initialised"; return false; }
-    const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD, NFF = ds.NFF, NFFD = ds.NFFD;
-    const int P = ds.n_pos;
-    if (P >= ds.cap) { err = "context length exceeded (" + std::to_string(P) + ")"; return false; }
-    if (vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) { err = "vexp arena"; return false; }
-
-    // persistent step scratch (allocated once in m3_decode_init): no per-step cudaMalloc/cudaFree, so no
-    // per-step whole-device drain.  The router D2H already syncs the stream once per step, and the stream's
-    // FIFO ordering keeps the reused buffers correct across steps.
+bool m3_layer_attn(Model& m, M3DecodeState& ds, int l, int P, float* xt, std::string& err) {
+    const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD;
     auto& SC = ds.scratch;
     cudaStream_t st = SC.st;
     auto die = [&](const char* w) -> bool { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; } return false; };
-
-    float *dx=SC.dx, *dh=SC.dh, *dq=SC.dq, *dk=SC.dk, *dv=SC.dv, *da=SC.da, *do_=SC.do_,
-          *dgate=SC.dgate, *dup=SC.dup, *dhh=SC.dhh, *df=SC.df, *dout=SC.dout,
-          *diq=SC.diq, *dik=SC.dik, *dq2=SC.dq2, *dk2=SC.dk2;
-    unsigned char* dmask=SC.dmask;
-    int32_t* dtok=SC.dtok;
-    cudaMemcpyAsync(dtok, &token_id, sizeof(int32_t), cudaMemcpyHostToDevice, st);
-    K::iq_embed_rows((int) ds.etype, ds.detab, ds.erow, dtok, 1, NE, dx, st); if (die("embed")) return false;
-
     auto mmf = [&](const M3DecodeState::QW& w, const float* f32a, float* y, int n_in, int n_out) -> bool {
         if (w.type == (int64_t) Q::Type::F32) {
             m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
-            return !die("mmf");
+        } else {
+            K::iq_mmvq_f32((int) w.type, w.d, f32a, y, n_in, n_out, st);
         }
-        K::iq_mmvq_f32((int) w.type, w.d, f32a, y, n_in, n_out, st);
         return !die("mmf");
     };
-
-    std::vector<float> scores((size_t) m.geom.n_expert), dh_host(NE), bias_host((size_t) m.geom.n_expert);
-    const bool dtrace = getenv("M3_TRACE") != nullptr;
-    const bool tprof = getenv("M3_TPROFILE") != nullptr;
-    char dts_buf[64];
-    auto dts = [&](const char* w, int l = -1) {
-        if (l < 0) std::snprintf(dts_buf, sizeof dts_buf, "[step] %s", w);
-        else std::snprintf(dts_buf, sizeof dts_buf, "[step] %s l=%d", w, l);
-        std::fprintf(stderr, "%s\n", dts_buf); std::fflush(stderr);
-    };
-    // per-section ms accumulators (M3_TPROFILE): attn | ffn = router (incl. D2H+sync) | routed experts | shared expert
-    double ms_attn = 0.0, ms_exp = 0.0, ms_router = 0.0, ms_routed = 0.0, ms_shared = 0.0;
-    auto now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
-    int sparse_idx = 0;
-    for (int l = 0; l < ds.nL; ++l) {
-        if (dtrace) dts("layer begin", l);
-        const auto& L = ds.layers[l];
-        const bool sparse = l >= ds.dense_lead;
-        float* xt = dx;
-        const double t_l0 = tprof ? now_ms() : 0.0;
+    const auto& L = ds.layers[l];
+    const bool sparse = l >= ds.dense_lead;
+    int sparse_idx = sparse ? l - ds.dense_lead : 0;
+    float *dh=SC.dh, *dq=SC.dq, *dk=SC.dk, *dv=SC.dv, *da=SC.da, *do_=SC.do_,
+          *diq=SC.diq, *dik=SC.dik, *dq2=SC.dq2, *dk2=SC.dk2;
+    const bool tprof = false;
+    auto now_ms = []() -> double { return 0.0; };
         // ---- attention ----
         m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.an, dh, NE, (float) m.geom.rms_eps);
         if (die("rms1")) return false;
@@ -1530,7 +1527,6 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             cudaMemcpyAsync(down.data() + (size_t) ns * idim + idim, dk2, kvn * 4, cudaMemcpyDeviceToHost, st);
             cudaMemcpyAsync(down.data() + (size_t) ns * idim + idim + kvn, dv, kvn * 4, cudaMemcpyDeviceToHost, st);
             cudaStreamSynchronize(st);
-            if (tprof) sp_d2h = now_ms() - sp0;
             // append position P to the pinned-RAM caches (F16 K/V, F32 indexer key)
             {
                 const float* kh = down.data() + (size_t) ns * idim + idim;
@@ -1557,7 +1553,6 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                         if (!seen[sels[(size_t) g].blocks[j]]) { seen[sels[(size_t) g].blocks[j]] = 1; union_blk.push_back(sels[(size_t) g].blocks[j]); }
                 }
             }
-            if (tprof) sp_score = now_ms() - sp0;
             // make every selected block resident in the per-layer GPU pool; the in-progress block is always
             // refetched (it just gained a position); victims are the least-recently-used blocks NOT in the union
             const int pg = ram.gpu_of(sparse_idx), pl = ram.local_of(sparse_idx);
@@ -1603,7 +1598,6 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
                         if (pblk[s] == sels[(size_t) g].blocks[j]) sel_pool[(size_t) g * nb + s] = 1;
             int last_slot = -1, last_valid = 0;
             for (int s = 0; s < nb; ++s) if (pblk[s] == b_last) { last_slot = s; last_valid = P % blk + 1; break; }
-            if (tprof) sp_fetch = now_ms() - sp0;
             // relay q to this layer's pool GPU, run the pool attention there, relay the output back.
             // Cross-device sync is host-side (consumer cards have no P2P); the decode path already
             // syncs the host once per sparse layer for the indexer batch.
@@ -1614,7 +1608,6 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             if (!ck("q H2D")) return false;
             cudaMemcpyAsync(ram.dsel[pg], sel_pool.data(), (size_t) ns * nb, cudaMemcpyHostToDevice, pst);
             if (!ck("sel H2D")) return false;
-            if (tprof) sp_relay = now_ms() - sp0;
             m3k::k_msa_attn_pool<<<H, HD, (nb * blk * 2 + 8) * (int) sizeof(float), pst>>>(ram.pool_q[pg],
                 ram.pool_k[pg] + (size_t) pl * nb * (size_t) blk * kvn,
                 ram.pool_v[pg] + (size_t) pl * nb * (size_t) blk * kvn,
@@ -1625,17 +1618,33 @@ bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
             cudaSetDevice(0);
             cudaMemcpyAsync(da, ram.da_relay, qbytes, cudaMemcpyHostToDevice, st);
             if (!ck("da H2D")) return false;
-            if (tprof) { sp_kern = now_ms() - sp0 - sp_relay; static double a_d2h=0,a_sc=0,a_fe=0,a_re=0,a_kn=0,a_n=0; a_d2h+=sp_d2h;a_sc+=sp_score;a_fe+=sp_fetch;a_re+=sp_relay;a_kn+=sp_kern; if (++a_n == 200) { std::fprintf(stderr, "[sparse-avg ms/layer] d2h=%.2f score=%.2f fetch=%.2f relay=%.2f kern=%.2f (n=200)\n", a_d2h/a_n, a_sc/a_n, a_fe/a_n, a_re/a_n, a_kn/a_n); a_n = 0; } }
-            if (getenv("M3_DBG_ATTN") && l == 4) { std::vector<float> d((size_t) H * HD); cudaMemcpy(d.data(), da, (size_t) H * HD * 4, cudaMemcpyDeviceToHost); FILE* f = fopen("/tmp/da_4.txt", "w"); for (int i2 = 0; i2 < (int) d.size(); ++i2) fprintf(f, "%.6f\n", d[i2]); fclose(f); }
             ++sparse_idx;
         }
-if (getenv("M3_DBG_DA") && l == 3) { std::vector<float> d((size_t) H * HD); cudaMemcpyAsync(d.data(), da, (size_t) H * HD * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); FILE* f = fopen("/tmp/da3_decode.txt", "w"); for (int i = 0; i < (int) d.size(); ++i) fprintf(f, "%.6f\n", d[i]); fclose(f); }
         if (die("attn")) return false;
         if (!mmf(L.wo, da, do_, H * HD, NE)) return false;
         m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, do_, NE);
-if (getenv("M3_DBG_XT")) { std::vector<float> d((size_t) NE); cudaMemcpyAsync(d.data(), xt, (size_t) NE * 4, cudaMemcpyDeviceToHost, st); cudaStreamSynchronize(st); FILE* f = fopen((std::string("/tmp/xt_") + std::to_string(l) + "_decode.txt").c_str(), "w"); for (int i = 0; i < (int) d.size(); ++i) fprintf(f, "%.6f\n", d[i]); fclose(f); }
-        if (die("add1")) return false;
-        const double t_attn_end = tprof ? now_ms() : 0.0;
+        if (die("add1")) return false;    return true;
+}
+
+bool m3_layer_ffn(Model& m, M3DecodeState& ds, int vexp_slots, int l, float* xt, std::string& err) {
+    const int NE = ds.NE, NFF = ds.NFF, NFFD = ds.NFFD;
+    auto& SC = ds.scratch;
+    cudaStream_t st = SC.st;
+    auto die = [&](const char* w) -> bool { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; } return false; };
+    auto mmf = [&](const M3DecodeState::QW& w, const float* f32a, float* y, int n_in, int n_out) -> bool {
+        if (w.type == (int64_t) Q::Type::F32) {
+            m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
+        } else {
+            K::iq_mmvq_f32((int) w.type, w.d, f32a, y, n_in, n_out, st);
+        }
+        return !die("mmf");
+    };
+    const auto& L = ds.layers[l];
+    const bool sparse = l >= ds.dense_lead;
+    float *dh=SC.dh, *dgate=SC.dgate, *dup=SC.dup, *dhh=SC.dhh, *df=SC.df, *do_=SC.do_;
+    std::vector<float> scores((size_t) m.geom.n_expert), bias_host((size_t) m.geom.n_expert);
+    const bool tprof = false;
+    auto now_ms = []() -> double { return 0.0; };
         // ---- FFN ----
         if (!sparse) {
             m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, L.fn, dh, NE, (float) m.geom.rms_eps);
@@ -1724,7 +1733,7 @@ if (getenv("M3_DBG_XT")) { std::vector<float> d((size_t) NE); cudaMemcpyAsync(d.
                             for (int e = 0; e < E_cnt; ++e)
                                 m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, E.st>>>(E.dgate_b + (size_t) e * NFF, E.dup_b + (size_t) e * NFF, E.dhh_b + (size_t) e * NFF, NFF);
                             for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) ed[e];
-                            K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, E.dhh_b, E.do_b, E.st);
+                            K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, E.dhh_b, E.do_b, E.st, 1);
                             for (int e = 0; e < E_cnt; ++e)
                                 m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, E.st>>>(E.df, E.do_b + (size_t) e * NE, wgt[e], NE);
                             const cudaError_t ee = cudaGetLastError();
@@ -1770,7 +1779,7 @@ if (getenv("M3_DBG_XT")) { std::vector<float> d((size_t) NE); cudaMemcpyAsync(d.
                         for (int e = 0; e < E_cnt; ++e)
                             m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(bg_g + (size_t) e * NFF, bg_u + (size_t) e * NFF, bg_h + (size_t) e * NFF, NFF);
                         for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) ed[e];
-                        K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, bg_h, bg_d, st);
+                        K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, bg_h, bg_d, st, 1);
                         for (int e = 0; e < E_cnt; ++e)
                             m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, bg_d + (size_t) e * NE, wgt[e], NE);
                         if (die("vexp batch")) return false;
@@ -1825,7 +1834,7 @@ if (getenv("M3_DBG_XT")) { std::vector<float> d((size_t) NE); cudaMemcpyAsync(d.
                         for (int e = 0; e < E_cnt; ++e)
                             m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(bg_g + (size_t) e * NFF, bg_u + (size_t) e * NFF, bg_h + (size_t) e * NFF, NFF);
                         for (int e = 0; e < E_cnt; ++e) wp[e] = (void*) ed[e];
-                        K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, bg_h, bg_d, st); if (die("vexp batch down")) return false;
+                        K::iq_mmvq_f32_batch(E_cnt, wp, dty, NFF, NE, bg_h, bg_d, st, 1); if (die("vexp batch down")) return false;
                         for (int e = 0; e < E_cnt; ++e)
                             m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, bg_d + (size_t) e * NE, wgt[e], NE);
                         if (die("vexp batch")) return false;
@@ -1841,18 +1850,264 @@ if (getenv("M3_DBG_XT")) { std::vector<float> d((size_t) NE); cudaMemcpyAsync(d.
             m3k::k_scale_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(df, do_, 1.0f, NE);
             m3k::k_add<<<(NE + 1023) / 1024, 1024, 0, st>>>(xt, df, NE);
             if (die("moe_ffn")) return false;
-            if (tprof) {
-                ms_router += (t_routed0 - t_router0);
-                ms_routed += (t_shared0 - t_routed0);
-                ms_shared += (now_ms() - t_shared0);
+        }
+    return true;
+}
+
+bool m3_step_layer(Model& m, M3DecodeState& ds, int vexp_slots, int l, int P, float* xt, std::string& err) {
+    if (!m3_layer_attn(m, ds, l, P, xt, err)) return false;
+    return m3_layer_ffn(m, ds, vexp_slots, l, xt, err);
+}
+
+
+// ===========================================================================
+// Chunked parallel prefill: C prompt tokens through the 60 layers in one pass.
+// Dense layers run fully parallel (chunk GEMMs + tiled FA); sparse layers run
+// attention per position (the decode machinery, which is position-correct) and
+// the FFN grouped by expert so each expert's weights stream once per chunk.
+//
+// The chunk GEMMs write to rotating bounce buffers (c.bnc): on this driver,
+// kernel stores to some of the long-lived scratch buffers are silently lost,
+// while the bounce buffers are reliable.
+
+bool m3_layer_ffn_chunk(Model& m, M3DecodeState& ds, int vexp_slots, int l, float* x_c, int C, std::string& err) {
+    const int NE = ds.NE, NFF = ds.NFF;
+    auto& SC = ds.scratch;
+    auto& c = ds.chunk;
+    cudaStream_t st = SC.st;
+    auto die = [&](const char* w) -> bool { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; } return false; };
+    auto mmq_c = [&](const M3DecodeState::QW& w, const float* x, float* y, int n_in, int n_out, float*& out) -> bool {
+        out = c.bnc[c.bnc_i];
+        c.bnc_i = (c.bnc_i + 1) & 3;
+        if (w.type == (int64_t) Q::Type::F32) {
+            K::iq_mmq_f32_chunk_f32w((const float*) w.d, x, out, n_in, n_out, C, st);
+        } else {
+            if (K::iq_row_bytes((int) w.type, n_in) == 0) { err = "chunk GEMM: unsupported type " + std::to_string(w.type); return false; }
+            K::iq_mmq_f32_chunk((int) w.type, w.d, x, out, n_in, n_out, C, st);
+        }
+        return !die("mmq_c");
+    };
+    const auto& L = ds.layers[l];
+    m3k::k_rms<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(x_c, L.fn, c.h, NE, (float) m.geom.rms_eps);
+    if (die("ffn rms")) return false;
+    // router: [C][n_expert] chunk GEMM, top-4 per position on the host
+    {
+        float* dr = nullptr;
+        if (cudaMalloc(&dr, (size_t) C * m.geom.n_expert * 4) != cudaSuccess) { err = "router scores"; return false; }
+        K::iq_mmq_f32_chunk_f32w(L.router, c.h, dr, NE, (int) m.geom.n_expert, C, st);
+        std::vector<float> sc((size_t) C * m.geom.n_expert), bias((size_t) m.geom.n_expert);
+        cudaMemcpyAsync(sc.data(), dr, sc.size() * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(bias.data(), L.bias, bias.size() * 4, cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        cudaFree(dr);
+        if (die("router D2H")) return false;
+        struct PE { int pos; float w; };
+        std::vector<std::vector<PE>> poslist(m.geom.n_expert);
+        for (int i = 0; i < C; ++i) {
+            mm::Route r = mm::route(sc.data() + (size_t) i * m.geom.n_expert, bias.data(),
+                                    (int) m.geom.n_expert, (int) m.geom.n_expert_used, true, 2.0f);
+            for (int s = 0; s < r.n; ++s)
+                poslist[r.experts[s]].push_back({ i, r.weights[s] });
+        }
+        // each distinct expert once: gather its (normalized) rows, GEMM, scatter-add the weighted output
+        for (size_t e = 0; e < poslist.size(); ++e) {
+            if (poslist[e].empty()) continue;
+            const int M = (int) poslist[e].size();
+            float *edout = c.bnc[0], *eg = c.bnc[1], *eu = c.bnc[2], *eh = c.bnc[3];
+            for (int j = 0; j < M; ++j)
+                cudaMemcpyAsync(edout + (size_t) j * NE, c.h + (size_t) poslist[e][j].pos * NE, (size_t) NE * 4, cudaMemcpyDeviceToDevice, st);
+            int64_t gty, uty, dty; uint64_t gb, ub, db;
+            const uint8_t *gh = m.raw_slot_fast(l, (int) e, "ffn_gate_exps.weight", gty, gb, err),
+                          *uh = m.raw_slot_fast(l, (int) e, "ffn_up_exps.weight", uty, ub, err),
+                          *dhb = m.raw_slot_fast(l, (int) e, "ffn_down_exps.weight", dty, db, err);
+            if (!gh || !uh || !dhb) { err = "expert " + std::to_string(e) + ": " + err; return false; }
+            static void *sg = nullptr, *su = nullptr, *sd = nullptr;
+            static size_t szg = 0, szu = 0, szd = 0;
+            if (szg < gb) { if (sg) cudaFree(sg); if (cudaMalloc(&sg, gb) != cudaSuccess) { err = "expert staging"; return false; } szg = gb; }
+            if (szu < ub) { if (su) cudaFree(su); if (cudaMalloc(&su, ub) != cudaSuccess) { err = "expert staging"; return false; } szu = ub; }
+            if (szd < db) { if (sd) cudaFree(sd); if (cudaMalloc(&sd, db) != cudaSuccess) { err = "expert staging"; return false; } szd = db; }
+            void *dg = sg, *du = su, *dd = sd;
+            cudaMemcpyAsync(dg, gh, gb, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(du, uh, ub, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(dd, dhb, db, cudaMemcpyHostToDevice, st);
+            if (gty == (int64_t) Q::Type::F32) K::iq_mmq_f32_chunk_f32w((const float*) dg, edout, eg, NE, NFF, M, st);
+            else K::iq_mmq_f32_chunk((int) gty, dg, edout, eg, NE, NFF, M, st);
+            if (uty == (int64_t) Q::Type::F32) K::iq_mmq_f32_chunk_f32w((const float*) du, edout, eu, NE, NFF, M, st);
+            else K::iq_mmq_f32_chunk((int) uty, du, edout, eu, NE, NFF, M, st);
+            for (int j = 0; j < M; ++j)
+                m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(eg + (size_t) j * NFF, eu + (size_t) j * NFF, eh + (size_t) j * NFF, NFF);
+            if (dty == (int64_t) Q::Type::F32) K::iq_mmq_f32_chunk_f32w((const float*) dd, eh, edout, NFF, NE, M, st);
+            else K::iq_mmq_f32_chunk((int) dty, dd, eh, edout, NFF, NE, M, st);
+            if (die("expert GEMV")) return false;
+            for (int j = 0; j < M; ++j)
+                m3k::k_scale_add<<<dim3((NE + 1023) / 1024, 1), 1024, 0, st>>>(x_c + (size_t) poslist[e][j].pos * NE, edout + (size_t) j * NE, poslist[e][j].w, NE);
+        }
+    }
+    // shared expert over all C positions (bounce buffers)
+    float *gate, *up, *df;
+    if (!mmq_c(L.sg, c.h, nullptr, NE, NFF, gate)) return false;
+    if (!mmq_c(L.su, c.h, nullptr, NE, NFF, up)) return false;
+    float *hh = c.bnc[c.bnc_i]; c.bnc_i = (c.bnc_i + 1) & 3;
+    for (int j = 0; j < C; ++j)
+        m3k::k_swiglu_oai<<<(NFF + 1023) / 1024, 1024, 0, st>>>(gate + (size_t) j * NFF, up + (size_t) j * NFF, hh + (size_t) j * NFF, NFF);
+    if (!mmq_c(L.sd, hh, nullptr, NFF, NE, df)) return false;
+    m3k::k_scale_add<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(x_c, df, 1.0f, NE);
+    if (die("shared expert")) return false;
+    return true;
+}
+
+
+constexpr int M3_CHUNK_FA_HD = 128;
+
+bool m3_prefill_chunk(Model& m, M3DecodeState& ds, int vexp_slots,
+                      const int* tokens, int C,
+                      std::vector<float>& logits, std::string& err, bool want_logits) {
+    if (!ds.ready) { err = "decode state not initialised"; return false; }
+    const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD, NFFD = ds.NFFD;
+    const int P0 = ds.n_pos;
+    if (P0 + C > ds.cap) { err = "context length exceeded"; return false; }
+    if (C > ds.chunk.C) { err = "chunk larger than scratch"; return false; }
+    if (vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) { err = "vexp arena: " + err; return false; }
+    auto& SC = ds.scratch;
+    auto& c = ds.chunk;
+    cudaStream_t st = SC.st;
+    auto die = [&](const char* w) -> bool { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; } return false; };
+    auto mmq_c = [&](const M3DecodeState::QW& w, const float* x, float* y, int n_in, int n_out, float*& out) -> bool {
+        out = c.bnc[c.bnc_i];
+        c.bnc_i = (c.bnc_i + 1) & 3;
+        if (w.type == (int64_t) Q::Type::F32) {
+            K::iq_mmq_f32_chunk_f32w((const float*) w.d, x, out, n_in, n_out, C, st);
+        } else {
+            if (K::iq_row_bytes((int) w.type, n_in) == 0) { err = "chunk GEMM: unsupported type " + std::to_string(w.type); return false; }
+            K::iq_mmq_f32_chunk((int) w.type, w.d, x, out, n_in, n_out, C, st);
+        }
+        return !die("mmq_c");
+    };
+    // embed the C tokens
+    {
+        std::vector<int32_t> t32(tokens, tokens + C);
+        cudaMemcpyAsync(c.rows, t32.data(), (size_t) C * sizeof(int32_t), cudaMemcpyHostToDevice, st);
+        K::iq_embed_rows((int) ds.etype, ds.detab, ds.erow, c.rows, C, NE, c.x, st);
+        if (die("embed")) return false;
+    }
+    for (int l = 0; l < ds.nL; ++l) {
+        const auto& L = ds.layers[l];
+        if (l < ds.dense_lead) {
+            // ---- parallel dense layer ----
+            m3k::k_rms<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(c.x, L.an, c.h, NE, (float) m.geom.rms_eps);
+            float *q, *k, *v, *o, *gate, *up, *hh, *df;
+            if (!mmq_c(L.wq, c.h, nullptr, NE, H * HD, q)) return false;
+            if (!mmq_c(L.wk, c.h, nullptr, NE, HKV * HD, k)) return false;
+            if (!mmq_c(L.wv, c.h, nullptr, NE, HKV * HD, v)) return false;
+            m3k::k_rms<<<dim3(1, C * H), HD, 0, st>>>(q, L.qn, c.q2, HD, m.dims.eps);
+            m3k::k_rms<<<dim3(1, C * HKV), HD, 0, st>>>(k, L.kn, c.k2, HD, m.dims.eps);
+            m3k::k_rope_c<<<dim3(H + HKV, C), m.dims.n_rot / 2, 0, st>>>(c.q2, c.k2, H, HKV, HD,
+                m.dims.n_rot, (float) P0, m.dims.rope_base, C);
+            if (die("rope_c")) return false;
+            float* lkv_k = ds.dkv_k + (size_t) l * HKV * ds.cap * HD;
+            float* lkv_v = ds.dkv_v + (size_t) l * HKV * ds.cap * HD;
+            m3k::k_kv_append_c<<<dim3(HKV, C), HD, 0, st>>>(lkv_k, c.k2, HKV, HD, ds.cap, P0, C);
+            m3k::k_kv_append_c<<<dim3(HKV, C), HD, 0, st>>>(lkv_v, v, HKV, HD, ds.cap, P0, C);
+            {
+                static_assert(M3_CHUNK_FA_HD == 128, "FA head dim");
+                static bool opted = false;
+                const int smem = (32 * M3_CHUNK_FA_HD + 64 * M3_CHUNK_FA_HD * 2 + 32 * 64) * (int) sizeof(float);
+                if (!opted) {
+                    cudaFuncSetAttribute((const void*) m3k::k_fa_dense<32, 64, M3_CHUNK_FA_HD>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                    opted = true;
+                }
+                // grid.y is ceil(C/32): the last query tile may extend past C (the kernel OOB-guards)
+                m3k::k_fa_dense<32, 64, M3_CHUNK_FA_HD><<<dim3(H, (C + 31) / 32), 256, smem, st>>>(c.q2, lkv_k, lkv_v, c.k2, v, c.a, H, HKV, HD, P0, C, ds.cap);
             }
+            if (die("fa_dense")) return false;
+            if (!mmq_c(L.wo, c.a, nullptr, H * HD, NE, o)) return false;
+            m3k::k_add<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(c.x, o, NE);
+            if (die("add1")) return false;
+            m3k::k_rms<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(c.x, L.fn, c.h, NE, (float) m.geom.rms_eps);
+            if (!mmq_c(L.dg, c.h, nullptr, NE, NFFD, gate)) return false;
+            if (!mmq_c(L.du, c.h, nullptr, NE, NFFD, up)) return false;
+            hh = c.bnc[c.bnc_i]; c.bnc_i = (c.bnc_i + 1) & 3;
+            m3k::k_swiglu_oai<<<dim3((NFFD + 1023) / 1024, C), 1024, 0, st>>>(gate, up, hh, NFFD);
+            if (!mmq_c(L.dd, hh, nullptr, NFFD, NE, df)) return false;
+            m3k::k_add<<<dim3((NE + 1023) / 1024, C), 1024, 0, st>>>(c.x, df, NE);
+            if (die("dense_ffn")) return false;
+        } else {
+            // ---- sparse layer: per-position attention + grouped chunk FFN ----
+            for (int i = 0; i < C; ++i) {
+                const int P = P0 + i;
+                cudaMemcpyAsync(SC.dx, c.x + (size_t) i * NE, (size_t) NE * 4, cudaMemcpyDeviceToDevice, st);
+                if (!m3_layer_attn(m, ds, l, P, SC.dx, err)) return false;
+                cudaMemcpyAsync(c.x + (size_t) i * NE, SC.dx, (size_t) NE * 4, cudaMemcpyDeviceToDevice, st);
+            }
+            if (!m3_layer_ffn_chunk(m, ds, vexp_slots, l, c.x, C, err)) return false;
         }
-        if (tprof) {
-            const double t_end = now_ms();
-            ms_attn += (t_attn_end - t_l0);
-            ms_exp += (t_end - t_attn_end);
+    }
+    ds.n_pos = P0 + C;
+    if (!want_logits) return true;
+    // ---- final norm + head for the last position ----
+    {
+        cudaMemcpyAsync(SC.dh, c.x + (size_t) (C - 1) * NE, (size_t) NE * 4, cudaMemcpyDeviceToDevice, st);
+        m3k::k_rms<<<(NE + 1023) / 1024, 1024, 0, st>>>(SC.dh, ds.out_norm, SC.dh, NE, (float) m.geom.rms_eps);
+        if (ds.head.type == (int64_t) Q::Type::F32)
+            m3k::k_f32_mm<<<(m.geom.n_vocab + 127) / 128, 128, 0, st>>>((const float*) ds.head.d, SC.dh, SC.dout, NE, (int) m.geom.n_vocab);
+        else
+            K::iq_mmvq_f32((int) ds.head.type, ds.head.d, SC.dh, SC.dout, NE, (int) m.geom.n_vocab, st);
+        logits.assign((size_t) m.geom.n_vocab, 0.0f);
+        cudaMemcpyAsync(logits.data(), SC.dout, (size_t) m.geom.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        if (die("head copy")) return false;
+    }
+    return true;
+}
+
+
+bool m3_decode_step(Model& m, M3DecodeState& ds, int vexp_slots, int token_id,
+                    std::vector<float>& logits, std::string& err, bool prefill_only = false) {
+    if (!ds.ready) { err = "decode state not initialised"; return false; }
+    const int NE = ds.NE, H = ds.n_head, HKV = ds.HKV, HD = ds.HD, NFF = ds.NFF, NFFD = ds.NFFD;
+    const int P = ds.n_pos;
+    if (P >= ds.cap) { err = "context length exceeded (" + std::to_string(P) + ")"; return false; }
+    if (vexp_slots > 0 && !g_vexp.init((size_t) vexp_slots, 32u << 20)) { err = "vexp arena"; return false; }
+
+    // persistent step scratch (allocated once in m3_decode_init): no per-step cudaMalloc/cudaFree, so no
+    // per-step whole-device drain.  The router D2H already syncs the stream once per step, and the stream's
+    // FIFO ordering keeps the reused buffers correct across steps.
+    auto& SC = ds.scratch;
+    cudaStream_t st = SC.st;
+    auto die = [&](const char* w) -> bool { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string(w) + ": " + cudaGetErrorString(e); return true; } return false; };
+
+    float *dx=SC.dx, *dh=SC.dh, *dq=SC.dq, *dk=SC.dk, *dv=SC.dv, *da=SC.da, *do_=SC.do_,
+          *dgate=SC.dgate, *dup=SC.dup, *dhh=SC.dhh, *df=SC.df, *dout=SC.dout,
+          *diq=SC.diq, *dik=SC.dik, *dq2=SC.dq2, *dk2=SC.dk2;
+    unsigned char* dmask=SC.dmask;
+    int32_t* dtok=SC.dtok;
+    cudaMemcpyAsync(dtok, &token_id, sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    K::iq_embed_rows((int) ds.etype, ds.detab, ds.erow, dtok, 1, NE, dx, st); if (die("embed")) return false;
+
+    auto mmf = [&](const M3DecodeState::QW& w, const float* f32a, float* y, int n_in, int n_out) -> bool {
+        if (w.type == (int64_t) Q::Type::F32) {
+            m3k::k_f32_mm<<<(n_out + 127) / 128, 128, 0, st>>>((const float*) w.d, f32a, y, n_in, n_out);
+            return !die("mmf");
         }
-        if (dtrace) dts("layer end", l);
+        K::iq_mmvq_f32((int) w.type, w.d, f32a, y, n_in, n_out, st);
+        return !die("mmf");
+    };
+
+    std::vector<float> scores((size_t) m.geom.n_expert), dh_host(NE), bias_host((size_t) m.geom.n_expert);
+    const bool dtrace = getenv("M3_TRACE") != nullptr;
+    const bool tprof = getenv("M3_TPROFILE") != nullptr;
+    char dts_buf[64];
+    auto dts = [&](const char* w, int l = -1) {
+        if (l < 0) std::snprintf(dts_buf, sizeof dts_buf, "[step] %s", w);
+        else std::snprintf(dts_buf, sizeof dts_buf, "[step] %s l=%d", w, l);
+        std::fprintf(stderr, "%s\n", dts_buf); std::fflush(stderr);
+    };
+    // per-section ms accumulators (M3_TPROFILE): attn | ffn = router (incl. D2H+sync) | routed experts | shared expert
+    double ms_attn = 0.0, ms_exp = 0.0, ms_router = 0.0, ms_routed = 0.0, ms_shared = 0.0;
+    auto now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    int sparse_idx = 0;
+    for (int l = 0; l < ds.nL; ++l) {
+        if (!m3_step_layer(m, ds, vexp_slots, l, P, dx, err)) return false;
     }
     if (tprof) {
         std::fprintf(stderr, "[tprof] step P=%d attn=%.1fms ffn=%.1fms [router=%.1f routed=%.1f shared=%.1f]\n",
@@ -2077,10 +2332,20 @@ int run(int argc, char** argv) {
             };
             std::vector<float> logits;
             bool ok = true;
+            const int chunk_sz = getenv("M3_CHUNK") ? atoi(getenv("M3_CHUNK")) : 0;
             const auto prompt_t0 = std::chrono::steady_clock::now();
             if (dbg) { std::fprintf(stderr, "[dbg] GEN start: prompt=%zu ids, max_new=%d temperature=%f top_p=%f top_k=%d\n",
                                     ids.size(), max_new, temperature, (double) top_p, top_k); std::fflush(stderr); }
-            for (size_t i = 0; i < ids.size(); ++i) {
+            for (size_t i = 0; i < ids.size(); i += (chunk_sz > 32 ? (size_t) chunk_sz : 1)) {
+                const size_t natural_end = std::min(ids.size(), i + (chunk_sz > 32 ? (size_t) chunk_sz : 1));
+                // the FA kernel's query tile is 32 rows: only chunk when a full tile remains
+                const size_t i_end = (chunk_sz > 32 && ids.size() - i >= 32) ? natural_end : i + 1;
+                const bool last_prompt = (i_end == ids.size());
+                if (i_end - i >= 32) {
+                    if (!m3_prefill_chunk(m, ds, vexp_slots, ids.data() + i, (int) (i_end - i), logits, err, last_prompt)) {
+                        std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); ok = false; break;
+                    }
+                } else {
                 if (trace) { tstamp(); ++trace_seq; }
                 if (dbg && (i == 0 || (i + 1) % 32 == 0 || i + 1 == ids.size()))
                     { std::fprintf(stderr, "[dbg] prompt step %zu/%zu begin (P=%d)\n", i + 1, ids.size(), ds.n_pos); std::fflush(stderr); }
@@ -2096,6 +2361,12 @@ int run(int argc, char** argv) {
                 const long prompt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - prompt_t0).count();
                 std::printf("PP %zu %zu %ld\n", i + 1, ids.size(), prompt_ms);
+                std::fflush(stdout);
+                }
+                // prompt progress (serve/server.py's PP line): every PP line resets the server's watchdog
+                const long prompt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - prompt_t0).count();
+                std::printf("PP %zu %zu %ld\n", i_end, ids.size(), prompt_ms);
                 std::fflush(stdout);
             }
             if (dbg) { std::fprintf(stderr, "[dbg] prompt done (P=%d), starting generation\n", ds.n_pos); std::fflush(stderr); }

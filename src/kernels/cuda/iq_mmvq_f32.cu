@@ -12,6 +12,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <cstdint>
 
 // The K-quants' 6-bit scale/min decoder (the bit twiddling is the part easy to get wrong), from
@@ -479,6 +480,101 @@ void iq_mmvq_f32_fused(int type, const void* w, const float* x, float* y, int n_
     }
 }
 
+
+// ===========================================================================
+// Chunk GEMMs: Y[M][n_out] = X[M][n_in] . W[n_out][n_in]^T  (prefill).
+//
+// One block per output row: the row is dequantised to shared memory ONCE, then
+// dotted against every one of the M activation rows.  The weights are read
+// once per layer-chunk instead of once per token - that is the whole point of
+// chunked prefill (decode reads them C times as many).
+extern "C" __global__ void __launch_bounds__(512)
+mmq_f32_chunk_kernel(const uint8_t* __restrict__ w, size_t row_bytes, int type,
+                     const float* __restrict__ x, float* __restrict__ y,
+                     int n_in, int n_out, int M) {
+    const int n = blockIdx.x;
+    if (n >= n_out) return;
+    extern __shared__ float sw[];
+    const uint8_t* wrow = w + (size_t) n * row_bytes;
+    const int qk = (type == 8) ? QK8_0 : (type == 40) ? QK_NVFP4 : QK_K;
+    const int nb = n_in / qk;
+    for (int bi = threadIdx.x; bi < nb; bi += blockDim.x) dequant_block(type, wrow, bi, sw);
+    __syncthreads();
+    __shared__ float warp_sum[16];
+    for (int m = 0; m < M; ++m) {
+        const float* xr = x + (size_t) m * n_in;
+        float acc = 0.f;
+        for (int i = threadIdx.x; i < n_in; i += blockDim.x) acc += sw[i] * xr[i];
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+        if ((threadIdx.x & 31) == 0) warp_sum[threadIdx.x >> 5] = acc;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < (blockDim.x >> 5)) ? warp_sum[threadIdx.x] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+            if (threadIdx.x == 0) y[(size_t) m * n_out + n] = v;
+        }
+        __syncthreads();
+    }
+}
+
+// F32-weighted variant (the small projections: idxq/idxk/router/head): the row is kept in shared memory
+// too - it is re-read M times, and shared beats L1 for that.
+extern "C" __global__ void __launch_bounds__(512)
+mmq_f32_chunk_f32w_kernel(const float* __restrict__ w,
+                          const float* __restrict__ x, float* __restrict__ y,
+                          int n_in, int n_out, int M) {
+    const int n = blockIdx.x;
+    if (n >= n_out) return;
+    extern __shared__ float sw[];
+    const float* wrow = w + (size_t) n * n_in;
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) sw[i] = wrow[i];
+    __syncthreads();
+    __shared__ float warp_sum[16];
+    for (int m = 0; m < M; ++m) {
+        const float* xr = x + (size_t) m * n_in;
+        float acc = 0.f;
+        for (int i = threadIdx.x; i < n_in; i += blockDim.x) acc += sw[i] * xr[i];
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+        if ((threadIdx.x & 31) == 0) warp_sum[threadIdx.x >> 5] = acc;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < (blockDim.x >> 5)) ? warp_sum[threadIdx.x] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+            if (threadIdx.x == 0) y[(size_t) m * n_out + n] = v;
+        }
+        __syncthreads();
+    }
+}
+
+void iq_mmq_f32_chunk(int ggml_type, const void* w, const float* x, float* y,
+                      int n_in, int n_out, int M, void* stream) {
+    const size_t row_bytes = iq_row_bytes(ggml_type, n_in);
+    if (row_bytes == 0) return;
+    size_t shmem = (size_t) n_in * sizeof(float);
+    static bool opted = false;
+    if (!opted) {
+        // Opt in BELOW the advertised max: on sm_120 sharedMemPerBlockOptin is 101376, but a
+        // 512-thread/110-register kernel can only get ~100000 (the driver folds register usage
+        // in). Requesting 101376 fails with invalid argument, the limit stays at the 48 KB
+        // default, and a 48 KB-dynamic + 64 B-static launch then dies with invalid argument
+        // (zero output) - seen with n_in=12288.
+        cudaFuncSetAttribute(mmq_f32_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 100000);
+        opted = true;
+    }    mmq_f32_chunk_kernel<<<n_out, 512, shmem, (cudaStream_t) stream>>>(
+        (const uint8_t*) w, row_bytes, ggml_type, x, y, n_in, n_out, M);
+}
+
+void iq_mmq_f32_chunk_f32w(const float* w, const float* x, float* y,
+                           int n_in, int n_out, int M, void* stream) {
+    const size_t shmem = (size_t) n_in * sizeof(float);
+    static bool opted = false;
+    if (!opted && shmem >= 48u << 10) {
+        cudaFuncSetAttribute(mmq_f32_chunk_f32w_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem);
+        opted = true;
+    }
+    mmq_f32_chunk_f32w_kernel<<<n_out, 512, shmem, (cudaStream_t) stream>>>(w, x, y, n_in, n_out, M);
+}
+
 // Batched GEMV: E experts (same type/shape, weight bases in `w[E]`) in one launch.  grid = E*n_out,
 // block (e, r) dots row r of expert e.  Lets a layer's four routed experts be copied in first and then
 // computed back-to-back with no copy/compute serialization between experts.
@@ -486,7 +582,7 @@ extern "C" __global__ void __launch_bounds__(512)
 mmvq_f32_batch(const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
                const uint8_t* __restrict__ w2, const uint8_t* __restrict__ w3,
                size_t row_bytes, int type,
-               const float* __restrict__ x, float* __restrict__ y, int n_in, int n_out, int E) {
+               const float* __restrict__ x, float* __restrict__ y, int n_in, int n_out, int E, int per_expert_x) {
     const int e = blockIdx.x / n_out;
     const int n = blockIdx.x % n_out;
     const uint8_t* wrow = (e == 0 ? w0 : e == 1 ? w1 : e == 2 ? w2 : w3) + (size_t) n * row_bytes;
@@ -495,8 +591,11 @@ mmvq_f32_batch(const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
     const int nb = n_in / qk;
     for (int bi = threadIdx.x; bi < nb; bi += blockDim.x) dequant_block(type, wrow, bi, sw);
     __syncthreads();
+    // per_expert_x: expert e reads its OWN input row x + e*n_in (the down projection, where each
+    // expert's swiglu output differs); otherwise all experts share x (gate/up on the same dh).
+    const float* xe = per_expert_x ? x + (size_t) e * n_in : x;
     float acc = 0.f;
-    for (int i = threadIdx.x; i < n_in; i += blockDim.x) acc += sw[i] * x[i];
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) acc += sw[i] * xe[i];
     __shared__ float warp_sum[32];
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
     if ((threadIdx.x & 31) == 0) warp_sum[threadIdx.x >> 5] = acc;
@@ -509,7 +608,7 @@ mmvq_f32_batch(const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
 }
 
 void iq_mmvq_f32_batch(int E, const void* const w[], int ggml_type, int n_in, int n_out,
-                       const float* x, float* y, void* stream) {
+                       const float* x, float* y, void* stream, int per_expert_x) {
     const size_t row_bytes = iq_row_bytes(ggml_type, n_in);
     if (row_bytes == 0) return;
     const size_t shmem = (size_t) n_in * sizeof(float);
@@ -520,7 +619,7 @@ void iq_mmvq_f32_batch(int E, const void* const w[], int ggml_type, int n_in, in
     const uint8_t* w2 = E > 2 ? (const uint8_t*) w[2] : nullptr;
     const uint8_t* w3 = E > 3 ? (const uint8_t*) w[3] : nullptr;
     mmvq_f32_batch<<<(size_t) E * n_out, 512, shmem, (cudaStream_t) stream>>>(
-        w0, w1, w2, w3, row_bytes, ggml_type, x, y, n_in, n_out, E);
+        w0, w1, w2, w3, row_bytes, ggml_type, x, y, n_in, n_out, E, per_expert_x);
 }
 
 }  // namespace strata::kernels

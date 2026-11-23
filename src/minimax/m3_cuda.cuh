@@ -22,10 +22,16 @@ __global__ void k_rms(const float* __restrict__ y, const float* __restrict__ w, 
 }
 
 /// Add: x += y, one row of n.
+__global__ void k_copy(float* __restrict__ x, const float* __restrict__ y, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = y[i];
+}
+
 __global__ void k_add(float* __restrict__ x, const float* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    x[(size_t) blockIdx.y * n + i] += y[i];
+    // y is row-major like x (blockIdx.y rows) - decode launches with grid.y=1
+    x[(size_t) blockIdx.y * n + i] += y[(size_t) blockIdx.y * n + i];
 }
 
 /// Partial RoPE, NEOX pairing, in place, on q (H heads) and k (HKV heads), head_dim HD, nrot pairs. t is the
@@ -96,7 +102,9 @@ __global__ void k_scale_add(float* __restrict__ x, const float* __restrict__ y, 
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t base = (size_t) blockIdx.y * n;
     if (i >= n) return;
-    x[base + i] += s * y[i];
+    // y is row-major like x (the shared-expert add launches with grid.y=C); decode/expert
+    // callers use grid.y=1 or per-row pointers, where base=0
+    x[base + i] += s * y[base + i];
 }
 
 /// x *= s, one row of n.
@@ -224,4 +232,184 @@ __global__ void k_msa_attn_pool(const float* __restrict__ q, const float* __rest
 }
 
 /// y[o] = sum_i W[o* n_in + i] * x[i], F32 weight (for the few F32 projections, e.g. the k/v of M3).
+
+// ===========================================================================
+// Chunked-prefill row kernels: C positions at a time (the decode path does one).
+/// RoPE for C positions: q/k rows m get position t0 + m.
+__global__ void k_rope_c(float* __restrict__ q, float* __restrict__ k, int H, int HKV, int HD,
+                         int nrot, float t0, float base, int C) {
+    const int head = blockIdx.x;
+    const int m = blockIdx.y;
+    float* v = (head < H ? q + (size_t) m * H * HD + (size_t) head * HD
+                         : k + (size_t) m * HKV * HD + (size_t) (head - H) * HD);
+    if (threadIdx.x >= nrot / 2) return;
+    const int i = threadIdx.x;
+    const float ang = (t0 + (float) m) * exp2f(-2.0f * (float) i / nrot * log2f(base));
+    const float cos = __cosf(ang), sin = __sinf(ang);
+    const float a = v[i], b = v[i + nrot / 2];
+    v[i] = a * cos - b * sin;
+    v[i + nrot / 2] = b * cos + a * sin;
+}
+
+/// Append C rows of K (or V) to the dense [HKV][cap][HD] cache at positions p0..p0+C-1.
+__global__ void k_kv_append_c(float* __restrict__ cache, const float* __restrict__ src,
+                              int HKV, int HD, int cap, int p0, int C) {
+    const int h = blockIdx.x;
+    const int m = blockIdx.y;
+    if (h >= HKV) return;
+    float* dst = cache + (size_t) h * cap * HD + (size_t) (p0 + m) * HD;
+    const float* s = src + ((size_t) m * HKV + h) * HD;
+    for (int j = threadIdx.x; j < HD; j += blockDim.x) dst[j] = s[j];
+}
+
+
+// ===========================================================================
+// Tiled flash attention for chunked prefill (dense-lead layers): C chunk positions attend to the
+// whole P-position prefix (GPU dense cache) plus their own causal chunk positions.
+//
+// FA2: a block owns one head and CQ=32 query rows; it streams KV in TK=64 tiles, computes
+// S = Q.K^T in shared, does the per-row online-softmax update (max/sum live in registers,
+// broadcast across the row's 8 threads), and accumulates O += P.V.  K/V are read once per
+// (head, tile) and reused across all 32 queries - the naive per-query loop would re-read the
+// prefix C times.  96 KB dynamic smem (opt-in).
+template <int CQ, int TK, int HD>
+__global__ void __launch_bounds__(256)
+k_fa_dense(const float* __restrict__ q,      // [C][H*HD]
+           const float* __restrict__ kvk,    // [P][HKV*HD] prefix K
+           const float* __restrict__ kvv,    // [P][HKV*HD] prefix V
+           const float* __restrict__ ckv_k,  // [C][HKV*HD] chunk K (rope'd)
+           const float* __restrict__ ckv_v,  // [C][HKV*HD] chunk V
+           float* __restrict__ out,          // [C][H*HD]
+           int H, int HKV, int hd, int P, int C, int cap) {
+    (void) hd;   // HD is the template parameter
+    // dynamic smem (90 KB - over the 48 KB static ceiling, opt-in at launch): [q tile | K tile | V tile | S tile]
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + CQ * HD;
+    float* sv = smem + CQ * HD + TK * HD;
+    float* ss = smem + CQ * HD + 2 * TK * HD;
+    const int h = blockIdx.x;
+    const int p0 = blockIdx.y * CQ;
+    const int t = threadIdx.x;
+    const int hkv = h / (H / HKV);
+    const float scale = rsqrtf((float) HD);
+    {
+        const int i = t / 8, d0 = (t % 8) * 16;
+        // the last query tile may extend past C (grid is ceil(C/32)): zero those rows
+        if (p0 + i < C) {
+            const float* qr = q + ((size_t) (p0 + i) * H + h) * HD;
+#pragma unroll
+            for (int d = 0; d < 16; ++d) sq[i * HD + d0 + d] = qr[d0 + d];
+        } else {
+#pragma unroll
+            for (int d = 0; d < 16; ++d) sq[i * HD + d0 + d] = 0.f;
+        }
+    }
+    __syncthreads();
+    const int ri = t / 8;                              // this thread's query row (within tile)
+    const int rd0 = (t % 8) * 16;                      // its O dim slice
+    float o[16];
+#pragma unroll
+    for (int d = 0; d < 16; ++d) o[d] = 0.f;
+    float m = -1e30f, l = 0.f;                          // per-row online state (all 8 row-lanes equal)
+
+    auto load_tile = [&](int t0, bool chunk) {
+        // K/V tile rows 0..TK-1 at positions t0+j (chunk: ckv; else prefix kvk/kvv); zero-fill beyond bounds
+        const int j = t / 4, d0 = (t % 4) * 32;
+        const float* kr; const float* vr;
+        if (chunk) {
+            // chunk K/V are position-major [C][HKV*HD]
+            kr = ckv_k + ((size_t) (t0 + j) * HKV + hkv) * HD;
+            vr = ckv_v + ((size_t) (t0 + j) * HKV + hkv) * HD;
+        } else {
+            // the GPU dense cache is head-major [HKV][cap][HD] (k_kv_append_c layout)
+            kr = kvk + (size_t) hkv * cap * HD + (size_t) (t0 + j) * HD;
+            vr = kvv + (size_t) hkv * cap * HD + (size_t) (t0 + j) * HD;
+        }
+        const bool valid = chunk ? (t0 + j < C) : (t0 + j < P);
+#pragma unroll
+        for (int d = 0; d < 32; ++d) {
+            sk[j * HD + d0 + d] = valid ? kr[d0 + d] : 0.f;
+            sv[j * HD + d0 + d] = valid ? vr[d0 + d] : 0.f;
+        }
+    };
+    auto tile = [&](int t0, bool chunk) {
+        load_tile(t0, chunk);
+        __syncthreads();
+        // S[i][j] = sum_d sq[i][d] * sk[j][d], masked; 8 cols per thread
+        {
+            const int i = t / 8, j0 = (t % 8) * 8;
+            const float* qrow = sq + i * HD;
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) {
+                const int j = j0 + jj;
+                float s = 0.f;
+                const bool ok = chunk ? (t0 + j <= p0 + i) : (t0 + j < P);
+                if (ok) {
+                    const float* krow = sk + j * HD;
+#pragma unroll
+                    for (int d = 0; d < HD; ++d) s += qrow[d] * krow[d];
+                    s *= scale;
+                } else s = -1e30f;
+                ss[i * TK + j] = s;
+            }
+        }
+        __syncthreads();
+        // online softmax row update: 8 lanes per row within one warp
+        {
+            const int j0 = (t % 8) * 8;
+            const float* srow = ss + ri * TK + j0;
+            float tm = -1e30f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) tm = fmaxf(tm, srow[j]);
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, o));
+            const float mn = fmaxf(m, tm);
+            const float corr = (m == -1e30f) ? 0.f : expf(m - mn);
+            float ls = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) ls += (srow[j] < -1e29f) ? 0.f : expf(srow[j] - mn);
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, o);
+            m = mn; l = l * corr + ls;
+#pragma unroll
+            for (int d = 0; d < 16; ++d) o[d] *= corr;
+        }
+        __syncthreads();
+        // O[i][d] += sum_j P[i][j] * V[j][d]; 16 dims per thread
+        {
+            const float* srow = ss + ri * TK;
+#pragma unroll 4
+            for (int j = 0; j < TK; ++j) {
+                const float p = (srow[j] < -1e29f) ? 0.f : expf(srow[j] - m);
+                if (p == 0.f) continue;
+                const float* vrow = sv + j * HD + rd0;
+#pragma unroll
+                for (int d = 0; d < 16; ++d) o[d] += p * vrow[d];
+            }
+        }
+        __syncthreads();
+    };
+    for (int t0 = 0; t0 < P; t0 += TK) tile(t0, false);
+    for (int t0 = 0; t0 < C; t0 += TK) tile(t0, true);
+    // epilogue: out = O / l
+    {
+        const int i = t / 8, d0 = (t % 8) * 16;
+        float* orow = out + ((size_t) (p0 + i) * H + h) * HD;
+        const float inv = (l > 0.f && p0 + i < C) ? 1.f / l : 0.f;
+#pragma unroll
+        for (int d = 0; d < 16; ++d) orow[d0 + d] = o[d] * inv;
+    }
+}
+
+/// Scatter-add: x[rows[i]] += y[i] * w  (expert outputs back into the C-row residual).
+__global__ void k_scatter_add(float* __restrict__ x, const int* __restrict__ rows,
+                              const float* __restrict__ y, float w, int n, int NE) {
+    const int i = blockIdx.x;
+    if (i >= n) return;
+    float* xr = x + (size_t) rows[i] * NE;
+    const float* yr = y + (size_t) i * NE;
+    for (int j = threadIdx.x; j < NE; j += blockDim.x) xr[j] += w * yr[j];
+}
+
 }  // namespace m3k

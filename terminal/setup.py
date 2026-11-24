@@ -11289,32 +11289,67 @@ def _m3_find_cuda():
     return None, None
 
 
-def _m3_build_engine(gpu_archs, a):
-    """Compile strata-m3 from this checkout's engine/ for the chosen GPUs; the path to the binary."""
-    cuda_home, nvcc = _m3_find_cuda()
-    if nvcc is None:
-        fail("no NVIDIA CUDA toolkit found (looked in CUDA_PATH and /usr/local/cuda-*); "
-             "install one to compile the strata-m3 engine")
-    archs = ";".join(f"{x}-real" for x in sorted(set(gpu_archs)))
+def _m3_build_engine(chosen, a):
+    """Compile strata-m3 from this checkout's engine/ for the chosen GPUs (CUDA or HIP); the path to the binary."""
     build_dir = ROOT.parent / "build-m3"
     exe = build_dir / "strata-m3"
     if exe.exists() and not a.setup:
         ok(f"the strata-m3 engine is already built ({exe})")
         return exe
+    if chosen[0].get("vendor") == "amd":
+        return _m3_build_engine_hip(chosen, a, build_dir, exe)
+    return _m3_build_engine_cuda(chosen, a, build_dir, exe)
+
+
+def _m3_build_engine_cuda(chosen, a, build_dir, exe):
+    """The NVIDIA (CUDA) build of strata-m3."""
+    cuda_home, nvcc = _m3_find_cuda()
+    if nvcc is None:
+        fail("no NVIDIA CUDA toolkit found (looked in CUDA_PATH and /usr/local/cuda-*); "
+             "install one to compile the strata-m3 engine")
+    archs = ";".join(f"{x}-real" for x in sorted(set(c["arch"] for c in chosen)))
     say(f"  compiling the strata-m3 engine for {archs} (CUDA {cuda_home.name}) - a few minutes ...")
     cfg = ["cmake", "-S", str(ROOT.parent / "engine"), "-B", str(build_dir),
            "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON",
            f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DCMAKE_CUDA_ARCHITECTURES={archs}"]
-    # long build: run it live (no capture, no timeout) so the user sees the progress; a non-zero exit is a failure
+    _m3_run_build(cfg, build_dir, exe, "the CUDA toolkit matches your driver")
+    return exe
+
+
+def _m3_build_engine_hip(chosen, a, build_dir, exe):
+    """The AMD (HIP) build of strata-m3: the same .cu sources through the gfx compat layer, ROCm from the system or TheRock wheels."""
+    archs = sorted({c["arch"] for c in chosen})
+    root, dirs = rocm_root(archs)
+    bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode") if p.is_dir()),
+                   root / "amdgcn" / "bitcode")
+    libs = [str(Path(d).parent) for d in dirs[1:]]
+    os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr",
+                       "ROCM_PATH": str(root), "HIP_PATH": str(root)})
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(rocm_clang(root).parent), os.environ.get("PATH", "")])
+    say(f"  compiling the strata-m3 engine for {', '.join(archs)} (HIP, ROCm {root.name}) - a few minutes ...")
+    cfg = ["cmake", "-S", str(ROOT.parent / "engine"), "-B", str(build_dir),
+           "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+           "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
+           "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+           f"-DCMAKE_HIP_COMPILER={rocm_clang(root)}",
+           f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+           "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
+           f"-DCMAKE_HIP_FLAGS=-isystem {root}/include --rocm-path={root} --rocm-device-lib-path={bitcode}"]
+    _m3_run_build(cfg, build_dir, exe, "ROCm matches your driver")
+    return exe
+
+
+def _m3_run_build(cfg, build_dir, exe, toolkit_hint):
+    """Run the cmake configure + ninja build live (no capture, no timeout) so the user sees the progress."""
     for cmd in (cfg, ["ninja", "-C", str(build_dir), "strata-m3"]):
         rc = subprocess.call(cmd)
         if rc != 0:
             fail(f"the strata-m3 engine build failed (exit {rc})",
-                 "check that cmake, ninja and a C++ compiler are installed, and that the CUDA toolkit matches your driver")
+                 "check that cmake, ninja and a C++ compiler are installed, and that " + toolkit_hint)
     if not exe.exists():
         fail("the build finished but strata-m3 is not where it should be", str(exe))
     ok(f"the strata-m3 engine is built ({exe})")
-    return exe
 
 
 def _m3_slots(vram_gb, reserve_gb):
@@ -11344,8 +11379,10 @@ def m3_setup(a) -> int:
     say("Strata - MiniMax-M3.1-Flash on a normal PC (a GPU + system RAM + CPU)")
     step(1, "checking your GPUs")
     cards = gpus()
+    if not cards:                                     # no NVIDIA card: the AMD (HIP) path, from the kernel's KFD topology
+        cards = amd_gpus()
     if not cards:
-        fail("no NVIDIA GPU found; the strata-m3 engine needs one")
+        fail("no supported GPU found; the strata-m3 engine needs an NVIDIA (CUDA) or AMD (HIP) card")
     # the strata-m3 engine's --gpus is a COUNT: it always uses the first N cards (indices 0..N-1), GPU 0 the main.
     # so the number asked for is what the engine will run, on cards 0..N-1.
     if a.gpus == "all" or a.gpus is None and a.gpu is None:
@@ -11360,7 +11397,9 @@ def m3_setup(a) -> int:
     if not chosen:
         fail(f"none of the requested GPUs ({a.gpus or a.gpu}) are usable NVIDIA cards")
     for c in chosen:
-        say(f"  GPU{c['index']}: {c['name']} ({c['vram_gb']:.0f} GB, sm_{c['arch']})" + (" (main)" if c["index"] == 0 else ""))
+        arch = c["arch"]
+        label = arch if c.get("vendor") == "amd" else f"sm_{arch}"
+        say(f"  GPU{c['index']}: {c['name']} ({c['vram_gb']:.0f} GB, {label})" + (" (main)" if c["index"] == 0 else ""))
     step(2, "choosing the quantization")
     models = M3_FAMILIES["minimax-m3"]["models"]
     quant = a.model if a.model in models else _m3_ask_quant(models)
@@ -11371,7 +11410,7 @@ def m3_setup(a) -> int:
     models_dir = a.models_dir or str(data / "models")
     shards = _m3_gather_shards(quant, model, models_dir)
     step(4, "building the strata-m3 engine")
-    exe = _m3_build_engine([c["arch"] for c in chosen], a)
+    exe = _m3_build_engine(chosen, a)
     step(5, "sizing the expert caches to your VRAM")
     # VRAM the model itself uses before any expert cache (measured on UD-Q2_K_XL: ~11.8 GB on the main card,
     # ~9.2 GB on each helper - the quantised weights' VRAM-resident part + KV + scratch).  The reserves leave a

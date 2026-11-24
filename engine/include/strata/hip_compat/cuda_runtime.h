@@ -47,6 +47,7 @@
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t
 #define cudaFree hipFree
+#define cudaFreeAsync hipFreeAsync
 #if HIP_VERSION_MAJOR < 7
 #define cudaFreeHost hipHostFree
 #else

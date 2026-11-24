@@ -189,6 +189,8 @@ class Model {
         idx.local = (int) geom.idx_local_blocks;
         idx.rope_base = dims.rope_base;
         idx.eps = dims.eps;
+        const strata::MetaValue* eos = meta.get("tokenizer.ggml.eos_token_id");
+        eos_token_id = eos && eos->is_num() ? (int64_t) eos->num() : -1;
         return true;
     }
 
@@ -344,6 +346,7 @@ class Model {
     mm::LayerDims dims;
     mm::IndexerShape idx;
     core::ModelGeometry geom;
+    int64_t eos_token_id = -1;   ///< tokenizer.ggml.eos_token_id: stop generating when this is emitted
 
   private:
     std::unique_ptr<strata::GgufModel> file_;
@@ -2544,6 +2547,7 @@ int run(int argc, char** argv) {
         }
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<int> produced;
+        bool hit_eos = false;   // set when the model emits its own EOS token
         if (use_gpu && use_quant) {
             // the decode engine: resident weights + a persistent KV cache, one step per token (no prefix
             // recomputation, no per-token weight re-upload).  g_ds is initialised at startup (before READY);
@@ -2619,6 +2623,7 @@ int run(int argc, char** argv) {
                     produced.push_back(best);
                     std::printf("T %d\n", best);
                     std::fflush(stdout);
+                    if (best == m.eos_token_id) { hit_eos = true; break; }   // the model's own end token
                     if (g + 1 < max_new) {
                         if (trace) { tstamp(); ++trace_seq; }
                         if (dbg) { std::fprintf(stderr, "[dbg] gen step %d: decode_step begin for token %d\n", g, best); std::fflush(stderr); }
@@ -2658,7 +2663,7 @@ int run(int argc, char** argv) {
             std::fflush(stderr);
         }
         std::printf("DONE %d %zu %.1f 0.0 %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", (long long) produced.size(), ids.size(),
-                    secs(t0), produced.empty() ? "" : "stop", ids.size(), (long long) 0);
+                    secs(t0), produced.empty() ? "" : (hit_eos ? "stop" : "length"), ids.size(), (long long) 0);
         std::fflush(stdout);
         if (stop.load()) break;
     }

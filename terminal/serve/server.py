@@ -8851,6 +8851,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             pass
         try:
             tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
+            for _k, _v in (tcfg.get("special_ids") or {}).items():   # stop at this model's own EOS, not just the built-in set
+                if "eos_token_id" in _k:
+                    EOS_IDS.add(int(_v))
         except ST.UnknownPreTokenizer as e:             # a model with its own splitting rule: stop here, never split with another's
             ap.error(f"the model's tokenizer ({tpath}): {e}")
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here

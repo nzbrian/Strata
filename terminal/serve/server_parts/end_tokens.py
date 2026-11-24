@@ -19,7 +19,10 @@ def end_token_ids(tokenizer) -> set[int]:
         if len(got) == 1:
             ids.add(int(got[0]))
     if not ids:
-        eos = (getattr(tokenizer, "special_ids", None) or {}).get("eos")
+        sp = getattr(tokenizer, "special_ids", None) or {}
+        eos = sp.get("eos")
+        if eos is None:
+            eos = sp.get("tokenizer.ggml.eos_token_id")
         if eos is not None:
             ids.add(int(eos))
     return ids

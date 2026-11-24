@@ -11589,7 +11589,9 @@ def _m3_build_engine_hip(chosen, a, build_dir, exe):
            f"-DCMAKE_HIP_COMPILER={rocm_clang(root)}",
            f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
            "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
-           f"-DCMAKE_HIP_FLAGS=-isystem {root}/include --rocm-path={root} --rocm-device-lib-path={bitcode}"]
+           # -w: the shared kernels emit hundreds of nodiscard / sign-compare / unused warnings under
+           # clang; suppress them so a real compile error is not buried in the noise
+           f"-DCMAKE_HIP_FLAGS=-w -isystem {root}/include --rocm-path={root} --rocm-device-lib-path={bitcode}"]
     _m3_run_build(cfg, build_dir, exe, "ROCm matches your driver")
     return exe
 

@@ -12011,9 +12011,10 @@ def main() -> int:
         rest = [*(f for f in OWN_PATH_FAMILIES if not OWN_PATH_FAMILIES[f].get("feed")),
                 *(f for f in OWN_PATH_FAMILIES if OWN_PATH_FAMILIES[f].get("feed")), *feed_late,
                 *(f for f in HY4_FAMILIES if hy4_offered(a)),
-                *(f for f in INKLING_FAMILIES if inkling_offered(a))]
+                *(f for f in INKLING_FAMILIES if inkling_offered(a)),
+                *M3_FAMILIES]
         for j, f in enumerate(rest, len(fams) + 1):    # families with an engine path of their own
-            d = {**FAMILIES, **OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES}[f]
+            d = {**FAMILIES, **OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES, **M3_FAMILIES}[f]
             say(f"  {j}) {cyan}{d['title']:20s}{reset} {d['by']} - {d['about']}   [new]" + (f"   ({FEED_UNAVAILABLE[f]['reason']})" if f in FEED_UNAVAILABLE else ""))
         for u in FEED_UNAVAILABLE.values():            # a feed model this engine does not run: said, never offered (unless the owner's rule allows it, above)
             if not u.get("allowed"):
@@ -12029,6 +12030,8 @@ def main() -> int:
         return install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted)
     if family in INKLING_FAMILIES:                     # Inkling-2-Mini: its own engine program (strata-inkling), its own files, its own steps 2-7
         return install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted)
+    if family in M3_FAMILIES:                          # MiniMax-M3.1-Flash: the self-contained strata-m3 path
+        return m3_setup(a)
     fam = FAMILIES[family]
     SHAPE_ENGINE.clear()
     if fam.get("shape"):                               # a feed model of its own shape: its own engine component (strata_control/shape_engine.py)

@@ -11665,6 +11665,14 @@ def m3_setup(a) -> int:
     data, _ = data_folder_for(a)
     models_dir = a.models_dir or str(data / "models")
     shards = _m3_gather_shards(quant, model, models_dir)
+    # the tokenizer is read from the GGUF once into the repo pack (gitignored); the engine and the server read it from there
+    tok_pack = ROOT.parent / "pack" / "minimax-m3"
+    if not (tok_pack / "tokenizer" / "vocab.json").is_file():
+        say("  extracting the tokenizer from the model ...")
+        sys.path.insert(0, str(ROOT / "tools"))
+        import strata_tokenizer
+        strata_tokenizer.extract(shards[0], tok_pack)
+        ok("the tokenizer is extracted")
     step(4, "building the strata-m3 engine")
     exe = _m3_build_engine(chosen, a)
     step(5, "sizing the expert caches to your VRAM")

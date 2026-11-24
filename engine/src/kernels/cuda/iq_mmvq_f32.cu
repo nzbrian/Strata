@@ -284,8 +284,8 @@ __device__ __forceinline__ void dq_iq1_m_one(const block_iq1_m* x, float* y) {
     // byte assembly for the four fp16 scales (the block need not be 2-byte aligned in the row)
     const uint8_t* sb = (const uint8_t*) (const void*) x->scales;   // ggml_half[] in the C flavour
     const uint16_t sc[4] = {
-        (uint16_t) sb[0] | ((uint16_t) sb[1] << 8), (uint16_t) sb[2] | ((uint16_t) sb[3] << 8),
-        (uint16_t) sb[4] | ((uint16_t) sb[5] << 8), (uint16_t) sb[6] | ((uint16_t) sb[7] << 8),
+        static_cast<uint16_t>((uint16_t) sb[0] | ((uint16_t) sb[1] << 8)), static_cast<uint16_t>((uint16_t) sb[2] | ((uint16_t) sb[3] << 8)),
+        static_cast<uint16_t>((uint16_t) sb[4] | ((uint16_t) sb[5] << 8)), static_cast<uint16_t>((uint16_t) sb[6] | ((uint16_t) sb[7] << 8)),
     };
     iq1m_scale_t scale;
     scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);

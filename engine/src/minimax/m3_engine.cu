@@ -728,6 +728,22 @@ struct RamKv {
     int local_of(int sparse_idx) const { return sparse_idx / ng; }
     bool init(int ns, int cap_, int HKV, int HD, int idx_dim, int blk, int qhd, int ngpu, std::string& err) {
         n_sparse = ns; cap = cap_; n_pos = 0;
+        // one-time diagnostic: how many devices does the runtime see, and how much free/total VRAM does each
+        // report? On the AMD box a small cudaMalloc failed on an empty 32 GB card, so print the runtime's own
+        // view before the first pool allocation to tell "cannot see the device" from "reports no free memory".
+        {
+            int dc = 0; cudaGetDeviceCount(&dc);
+            std::fprintf(stderr, "[diag] cudaGetDeviceCount = %d\n", dc);
+            for (int g = 0; g < dc && g < 4; ++g) {
+                size_t fb = 0, tb = 0;
+                cudaError_t e1 = cudaSetDevice(g);
+                cudaError_t e2 = cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr, "[diag] dev %d: setDevice=%s free=%llu MB total=%llu MB (memgetinfo=%s)\n",
+                    g, e1 == cudaSuccess ? "ok" : "ERR", (unsigned long long)(fb >> 20),
+                    (unsigned long long)(tb >> 20), e2 == cudaSuccess ? "ok" : "ERR");
+            }
+            cudaSetDevice(0);
+        }
         ng = ngpu < kNgpu ? ngpu : kNgpu;         // shard across the GPUs actually in use (max 3)
         layers_per_gpu = (ns + ng - 1) / ng;
         const size_t kvb = (size_t) ns * cap * HKV * HD;      // F32 elements

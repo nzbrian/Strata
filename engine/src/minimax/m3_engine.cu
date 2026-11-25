@@ -753,13 +753,21 @@ struct RamKv {
             cudaHostAlloc(&rik, ikb * 4, cudaHostAllocDefault) != cudaSuccess) { err = "ram kv pinned"; return false; }
         const size_t pob = (size_t) layers_per_gpu * kPoolBlocks * blk * HKV * HD;   // F32 elements per GPU
         const int smem_bytes = (kPoolBlocks * blk * 2 + 8) * (int) sizeof(float);
+        std::fprintf(stderr, "[diag] smem_bytes=%d pool_k size=%llu MB (pob=%llu)\n", smem_bytes,
+            (unsigned long long)((pob * 4) >> 20), (unsigned long long)pob);
         for (int g = 0; g < ng; ++g) {
             cudaSetDevice(g);   // each pool lives on its own card; the smem opt-in is per-context
-            if (cudaFuncSetAttribute((const void*) m3k::k_msa_attn_pool, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes) != cudaSuccess ||
-                cudaStreamCreate(&pool_st[g]) != cudaSuccess ||
-                cudaMalloc(&pool_k[g], pob * 4) != cudaSuccess ||
-                cudaMalloc(&pool_v[g], pob * 4) != cudaSuccess ||
-                cudaMalloc(&dsel[g], (size_t) 4 * kPoolBlocks) != cudaSuccess) { err = "ram kv pool"; return false; }
+            cudaError_t e;
+            e = cudaFuncSetAttribute((const void*) m3k::k_msa_attn_pool, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+            if (e != cudaSuccess) { err = "ram kv: cudaFuncSetAttribute code=" + std::to_string((int)e); return false; }
+            e = cudaStreamCreate(&pool_st[g]);
+            if (e != cudaSuccess) { err = "ram kv: cudaStreamCreate code=" + std::to_string((int)e); return false; }
+            e = cudaMalloc(&pool_k[g], pob * 4);
+            if (e != cudaSuccess) { err = "ram kv: cudaMalloc pool_k code=" + std::to_string((int)e) + " size=" + std::to_string((unsigned long long)(pob * 4)); return false; }
+            e = cudaMalloc(&pool_v[g], pob * 4);
+            if (e != cudaSuccess) { err = "ram kv: cudaMalloc pool_v code=" + std::to_string((int)e); return false; }
+            e = cudaMalloc(&dsel[g], (size_t) 4 * kPoolBlocks);
+            if (e != cudaSuccess) { err = "ram kv: cudaMalloc dsel code=" + std::to_string((int)e); return false; }
         }
         const size_t qbytes = (size_t) qhd * 4;
         if (cudaHostAlloc(&q_relay, qbytes, cudaHostAllocDefault) != cudaSuccess ||

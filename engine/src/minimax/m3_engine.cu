@@ -723,11 +723,13 @@ struct RamKv {
     int *pool_blk = nullptr, *pool_age = nullptr;  // host LRU state [n_sparse][kPoolBlocks]
     int n_sparse = 0, cap = 0, n_pos = 0, age = 0, layers_per_gpu = 0;
     bool ready = false;
-    int gpu_of(int sparse_idx) const { return sparse_idx % kNgpu; }
-    int local_of(int sparse_idx) const { return sparse_idx / kNgpu; }
-    bool init(int ns, int cap_, int HKV, int HD, int idx_dim, int blk, int qhd, std::string& err) {
+    int ng = 1;                                   // GPUs the pools are sharded across (<= kNgpu)
+    int gpu_of(int sparse_idx) const { return sparse_idx % ng; }
+    int local_of(int sparse_idx) const { return sparse_idx / ng; }
+    bool init(int ns, int cap_, int HKV, int HD, int idx_dim, int blk, int qhd, int ngpu, std::string& err) {
         n_sparse = ns; cap = cap_; n_pos = 0;
-        layers_per_gpu = (ns + kNgpu - 1) / kNgpu;
+        ng = ngpu < kNgpu ? ngpu : kNgpu;         // shard across the GPUs actually in use (max 3)
+        layers_per_gpu = (ns + ng - 1) / ng;
         const size_t kvb = (size_t) ns * cap * HKV * HD;      // F32 elements
         const size_t ikb = (size_t) ns * cap * idx_dim;       // F32 elements
         if (cudaHostAlloc(&rk, kvb * 4, cudaHostAllocDefault) != cudaSuccess ||
@@ -735,7 +737,7 @@ struct RamKv {
             cudaHostAlloc(&rik, ikb * 4, cudaHostAllocDefault) != cudaSuccess) { err = "ram kv pinned"; return false; }
         const size_t pob = (size_t) layers_per_gpu * kPoolBlocks * blk * HKV * HD;   // F32 elements per GPU
         const int smem_bytes = (kPoolBlocks * blk * 2 + 8) * (int) sizeof(float);
-        for (int g = 0; g < kNgpu; ++g) {
+        for (int g = 0; g < ng; ++g) {
             cudaSetDevice(g);   // each pool lives on its own card; the smem opt-in is per-context
             if (cudaFuncSetAttribute((const void*) m3k::k_msa_attn_pool, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes) != cudaSuccess ||
                 cudaStreamCreate(&pool_st[g]) != cudaSuccess ||
@@ -746,7 +748,7 @@ struct RamKv {
         const size_t qbytes = (size_t) qhd * 4;
         if (cudaHostAlloc(&q_relay, qbytes, cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc(&da_relay, qbytes, cudaHostAllocDefault) != cudaSuccess) { err = "ram kv relay"; return false; }
-        for (int g = 0; g < kNgpu; ++g) {
+        for (int g = 0; g < ng; ++g) {
             cudaSetDevice(g);
             if (cudaMalloc(&pool_q[g], qbytes) != cudaSuccess || cudaMalloc(&pool_da[g], qbytes) != cudaSuccess) { err = "ram kv q/da"; return false; }
         }
@@ -754,7 +756,7 @@ struct RamKv {
         const size_t qcb = (size_t) kSub * qhd * 4;
         if (cudaHostAlloc(&q_relay_c, qcb, cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc(&da_relay_c, qcb, cudaHostAllocDefault) != cudaSuccess) { err = "ram kv relay_c"; return false; }
-        for (int g = 0; g < kNgpu; ++g) {
+        for (int g = 0; g < ng; ++g) {
             cudaSetDevice(g);
             if (cudaFuncSetAttribute((const void*) m3k::k_msa_attn_pool_c, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes) != cudaSuccess ||
                 cudaMalloc(&pool_q_c[g], qcb) != cudaSuccess || cudaMalloc(&pool_da_c[g], qcb) != cudaSuccess ||
@@ -1452,7 +1454,7 @@ bool m3_decode_init(Model& m, M3DecodeState& ds, bool use_quant, int cap, int n_
     // (a 250k-context F32 sparse KV would be ~65 GB, long past any card here)
     if (cudaMalloc(&ds.dkv_k, (size_t) ds.dense_lead * HKV * cap * HD * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&ds.dkv_v, (size_t) ds.dense_lead * HKV * cap * HD * sizeof(float)) != cudaSuccess) { err = "dense KV allocation: " + std::string(cudaGetErrorString(cudaGetLastError())); return false; }
-    if (!ds.ram.init(ds.n_sparse, cap, HKV, HD, m.idx.dim, m.idx.blk, H * HD, err)) { err = "ram kv: " + err; return false; }
+    if (!ds.ram.init(ds.n_sparse, cap, HKV, HD, m.idx.dim, m.idx.blk, H * HD, g_mg.n_gpus, err)) { err = "ram kv: " + err; return false; }
     if (cudaMalloc(&ds.d_part, (size_t) NE * sizeof(float)) != cudaSuccess) { err = "d_part allocation"; return false; }
     {   // chunked-prefill scratch: C rows of every per-position buffer
         const int C = 1024;

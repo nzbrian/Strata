@@ -11683,8 +11683,11 @@ def m3_setup(a) -> int:
     main_gpu = chosen[0]                                  # the engine's GPU 0: model weights + KV + the vexperts cache
     vexperts = _m3_slots(main_gpu["vram_gb"], reserve_gb=12.5)
     helpers = chosen[1:]
-    # every helper shares one --expslots count: size it to the SMALLEST helper so none runs out of VRAM
-    expslots = min((_m3_slots(c["vram_gb"], reserve_gb=10.0) for c in helpers), default=0) if helpers else 0
+    # every helper shares one --expslots count: size it to the SMALLEST helper so none runs out of VRAM.
+    # A higher reserve than the main card: helpers also hold their KV-pool share + scratch, and consumer cards
+    # keep VRAM for the display, so 256 slots (8 GB) overran a 24 GB card. 20 GB reserve -> ~125 slots (4 GB)
+    # on a 24 GB card; larger helpers are unaffected (still capped at 256).
+    expslots = min((_m3_slots(c["vram_gb"], reserve_gb=20.0) for c in helpers), default=0) if helpers else 0
     ctx = a.context or 8192
     say(f"  GPU{main_gpu['index']} (main): {vexperts} expert slots" +
         (f"; helpers: {expslots} slots each" if expslots else ""))

@@ -11919,6 +11919,18 @@ def _m3_ask_quant(models):
         say("  pick a number")
 
 
+def m3_wanted(a) -> bool:
+    """Does this request mean MiniMax-M3.1-Flash? The family says it; a size name says it only when no other family
+    claims that name - UD-Q2_K_XL and UD-Q3_K_XL are Unsloth's names that the qwen and Inkling-2-Mini tables use
+    too, so `--family qwen --model UD-Q2_K_XL` is the qwen model, not strata-m3."""
+    if a.family in M3_FAMILIES:
+        return True
+    if a.family or not a.model or a.model not in M3_FAMILIES["minimax-m3"]["models"]:
+        return False
+    others = {**OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES}
+    return a.model not in MODELS and not any(a.model in sizes_of_family(f) for f in others.values())
+
+
 def m3_setup(a) -> int:
     """MiniMax-M3.1-Flash: the self-contained strata-m3 path (see M3_FAMILIES)."""
     say("Strata - MiniMax-M3.1-Flash on a normal PC (a GPU + system RAM + CPU)")
@@ -12292,7 +12304,7 @@ def main() -> int:
             a.gpus = ",".join(str(i) for i in order)
         else:
             a.gpu = order[0]
-    if a.family in M3_FAMILIES or (a.model and a.model in M3_FAMILIES["minimax-m3"]["models"]):
+    if m3_wanted(a):
         return m3_setup(a)                                # MiniMax-M3.1-Flash: the self-contained strata-m3 path
     _fams = {**OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES}
     say("Strata - " + (_fams[a.family]["title"] if a.family in _fams else "Qwen3.8-Flash-Next")
